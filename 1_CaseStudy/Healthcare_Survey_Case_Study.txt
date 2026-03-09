@@ -1,0 +1,80 @@
+CASE STUDY
+Healthcare Survey Feedback Analysis
+
+Project Overview
+
+A community healthcare survey collected 300 open-ended responses from respondents describing the challenges they face when accessing healthcare services.
+
+Manually reading and categorizing hundreds of responses can take several days and may miss recurring patterns.
+
+This project demonstrates how Natural Language Processing (NLP) can automatically analyze large volumes of qualitative feedback and produce structured insights.
+
+Dataset
+
+• Total responses analyzed: 300
+• Data type: Open-ended survey responses
+• Topic: Healthcare access challenges
+
+Methodology
+
+The analysis pipeline performs several automated steps:
+
+• Text preprocessing and cleaning
+• Sentiment analysis
+• Sentence embeddings using transformer models
+• Clustering responses into thematic groups
+• Keyword extraction for each theme
+• Automated insight generation
+
+Technologies Used
+
+Python with machine learning libraries including:
+
+• SentenceTransformers
+• scikit-learn
+• NLTK
+
+Key Themes Identified
+
+The system automatically identified multiple recurring themes in the survey responses, including:
+
+• Long waiting times at healthcare facilities
+• High cost of consultation and medication
+• Long distances to health centers
+• Medicine stock shortages
+• Negative staff attitudes
+• Transportation barriers
+
+Key Insights
+
+The analysis revealed several major issues affecting healthcare access.
+
+• Transportation and distance barriers were mentioned frequently by respondents.
+
+• Long waiting times generated strong negative sentiment among patients.
+
+• Cost of healthcare services remains a major challenge for many respondents.
+
+• Medicine stock shortages were also reported as a recurring issue.
+
+Business Value
+
+Instead of manually reading hundreds of responses, the NLP system automatically groups feedback into themes and highlights the most critical issues.
+
+This allows organizations to:
+
+• Quickly understand major challenges faced by communities
+• Prioritize service improvements
+• Make faster data-driven decisions
+• Reduce manual analysis time
+
+Deliverables
+
+The system produces a structured Excel report containing:
+
+• Executive summary for decision makers
+• Theme analysis table
+• Charts visualizing major issues
+• Key insights
+• Strategic recommendations
+• Full categorized response dataset
