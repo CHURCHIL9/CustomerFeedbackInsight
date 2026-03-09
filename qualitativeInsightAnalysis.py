@@ -257,6 +257,74 @@ class FeedbackInsightEngine:
 
         self.summary_df["Recommendation"] = recs
 
+    #-------------------------------------------------
+    # INSIGHT GENERATION
+    #-------------------------------------------------
+
+    def generate_key_insights(self):
+
+        insights = []
+
+        top = self.summary_df.iloc[0]
+
+        insights.append(
+            f"The most common issue reported by respondents is '{top['Theme']}', "
+            f"mentioned in {top['Percentage (%)']}% of responses."
+        )
+
+        negative = self.summary_df.sort_values("Average Sentiment").iloc[0]
+
+        insights.append(
+            f"The theme with the most negative sentiment is '{negative['Theme']}', "
+            f"suggesting strong dissatisfaction among respondents."
+        )
+
+        high_severity = self.summary_df.iloc[0]
+
+        insights.append(
+            f"Based on severity scoring, '{high_severity['Theme']}' appears to be the "
+            f"most critical issue requiring attention."
+        )
+
+        self.key_insights = insights
+
+    #-------------------------------------------------
+    # PRIORITY LEVELS
+    #-------------------------------------------------
+
+    def add_priority_labels(self):
+
+        priorities = []
+
+        for score in self.summary_df["Severity Score"]:
+
+            if score > 20:
+                priorities.append("High Priority")
+
+            elif score > 10:
+                priorities.append("Medium Priority")
+
+            else:
+                priorities.append("Low Priority")
+
+        self.summary_df["Priority"] = priorities
+
+    #-------------------------------------------------
+    # DATASET SUMMARY
+    #-------------------------------------------------
+
+    def generate_dataset_summary(self):
+
+        total = len(self.df)
+
+        avg_length = self.df[self.text_column].apply(lambda x: len(str(x).split())).mean()
+
+        self.dataset_summary = {
+            "Total Responses": total,
+            "Average Response Length": round(avg_length, 1),
+            "Themes Identified": len(self.summary_df)
+        }
+
     # ------------------------------------------------
     # LABEL DATA
     # ------------------------------------------------
@@ -336,17 +404,35 @@ class FeedbackInsightEngine:
 
         ws.merge_cells("A1:E1")
 
+        # DATASET OVERVIEW
+
         ws["A3"] = "Total Responses"
-        ws["B3"] = len(self.df)
+        ws["B3"] = self.dataset_summary["Total Responses"]
 
-        ws["A4"] = "Themes Identified"
-        ws["B4"] = len(self.summary_df)
+        ws["A4"] = "Average Response Length"
+        ws["B4"] = self.dataset_summary["Average Response Length"]
 
-        ws["A5"] = "Top Issue"
-        ws["B5"] = self.summary_df.iloc[0]["Theme"]
+        ws["A5"] = "Themes Identified"
+        ws["B5"] = self.dataset_summary["Themes Identified"]
 
-        ws["A6"] = "Most Severe Issue"
-        ws["B6"] = self.summary_df.iloc[0]["Theme"]
+        # TOP INSIGHTS
+
+        ws["A7"] = "Top Issue"
+        ws["B7"] = self.summary_df.iloc[0]["Theme"]
+
+        ws["A8"] = "Most Severe Issue"
+        ws["B8"] = self.summary_df.iloc[0]["Theme"]
+
+        # KEY INSIGHTS SECTION
+
+        ws["A10"] = "Key Insights"
+        ws["A10"].font = Font(bold=True)
+
+        row = 11
+
+        for insight in self.key_insights:
+            ws[f"A{row}"] = f"• {insight}"
+            row += 1
 
         self.auto_width(ws)
 
@@ -456,8 +542,17 @@ class FeedbackInsightEngine:
         print("Generating insights...")
         self.build_summary_table()
 
+        print("Adding priority labels...")
+        self.add_priority_labels()
+
         print("Generating recommendations...")
         self.generate_recommendations()
+
+        print("Generating key insights...")
+        self.generate_key_insights()
+
+        print("Generating dataset summary...")
+        self.generate_dataset_summary()
 
         print("Labeling responses...")
         self.label_data()
@@ -465,6 +560,7 @@ class FeedbackInsightEngine:
         print("Building Excel report...")
         self.build_excel_report()
 
+        print("Analysis complete.")
 
 # In[2]
 
