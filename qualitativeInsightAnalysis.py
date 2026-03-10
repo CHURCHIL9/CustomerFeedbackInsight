@@ -22,16 +22,27 @@ nltk.download("vader_lexicon")
 
 class FeedbackInsightEngine:
 
-    def __init__(self, file_path, text_column):
+    def __init__(self, file_path, text_columns):
 
         self.file_path = file_path
-        self.text_column = text_column
+        self.text_columns = text_columns
 
         self.df = pd.read_csv(file_path)
+
+        self.vectorizer = TfidfVectorizer(
+            stop_words="english",
+            ngram_range=(1,2),
+            min_df=2,
+            max_df=0.9,
+            max_features=8000
+        )
 
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
 
         self.sentiment_model = SentimentIntensityAnalyzer()
+
+        # store results per question
+        self.question_results = {}
 
     # ------------------------------------------------
     # CLEAN TEXT
@@ -45,9 +56,70 @@ class FeedbackInsightEngine:
 
         return text
 
+    # ------------------------------------------------
+    # SPLIT RESPONSES INTO SENTENCES
+    # ------------------------------------------------
+
+    def split_sentences(self, text):
+
+        parts = re.split(r"[.!?;]", text)
+
+        sentences = []
+
+        for p in parts:
+
+            p = p.strip()
+
+            if len(p.split()) >= 3:
+                sentences.append(p)
+
+        return sentences
+
+    # ------------------------------------------------
+    # COMPRESS TEXT (FOR BETTER CLUSTERING)
+    # ------------------------------------------------
+
+    def compress_text(self, text):
+
+        tokens = text.split()
+
+        filtered = [
+            t for t in tokens
+            if len(t) > 3
+        ]
+
+        return " ".join(filtered)
+
     def preprocess(self):
 
-        self.df["clean_text"] = self.df[self.text_column].apply(self.clean_text)
+        rows = []
+
+        for text in self.q_df["response"]:
+
+            clean = self.clean_text(text)
+
+            sentences = self.split_sentences(clean)
+
+            for s in sentences:
+
+                rows.append(s)
+
+        self.q_df = pd.DataFrame({"clean_text": rows})
+
+        # compressed version for clustering
+        self.q_df["compressed_text"] = self.q_df["clean_text"].apply(self.compress_text)
+
+    # ------------------------------------------------
+    # BUILD TF-IDF MATRIX
+    # ------------------------------------------------
+
+    def build_tfidf_matrix(self):
+
+        texts = self.q_df["compressed_text"].tolist()
+
+        self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+
+        self.feature_names = self.vectorizer.get_feature_names_out()
 
     # ------------------------------------------------
     # SENTIMENT ANALYSIS
@@ -57,11 +129,11 @@ class FeedbackInsightEngine:
 
         scores = []
 
-        for text in self.df["clean_text"]:
+        for text in self.q_df["clean_text"]:
             score = self.sentiment_model.polarity_scores(text)["compound"]
             scores.append(score)
 
-        self.df["sentiment"] = scores
+        self.q_df["sentiment"] = scores
 
     # ------------------------------------------------
     # EMBEDDINGS
@@ -69,11 +141,11 @@ class FeedbackInsightEngine:
 
     def create_embeddings(self):
 
-        texts = self.df["clean_text"].tolist()
+        texts = self.q_df["compressed_text"].tolist()
 
         embeddings = self.model.encode(
             texts,
-            batch_size=32,
+            batch_size=64,
             show_progress_bar=True
         )
 
@@ -85,7 +157,7 @@ class FeedbackInsightEngine:
 
     def choose_clusters(self):
 
-        n = len(self.df)
+        n = len(self.q_df)
 
         if n < 200:
 
@@ -125,28 +197,94 @@ class FeedbackInsightEngine:
             n_init=10
         )
 
-        self.df["cluster"] = self.kmeans.fit_predict(self.embeddings)
+        self.q_df["cluster"] = self.kmeans.fit_predict(self.embeddings)
+
+    # ------------------------------------------------
+    # FILTER LOW QUALITY CLUSTERS
+    # ------------------------------------------------
+
+    def filter_clusters(self, min_size=5):
+
+        cluster_counts = self.q_df["cluster"].value_counts()
+
+        valid_clusters = cluster_counts[cluster_counts >= min_size].index
+
+        self.q_df = self.q_df[self.q_df["cluster"].isin(valid_clusters)].copy()
 
     # ------------------------------------------------
     # KEYWORD EXTRACTION
     # ------------------------------------------------
 
-    def extract_keywords(self, texts, top_n=6):
+    # ------------------------------------------------
+    # PHRASE-AWARE KEYWORD EXTRACTION
+    # ------------------------------------------------
 
-        vectorizer = TfidfVectorizer(
-            stop_words="english",
-            max_features=5000
-        )
+    def extract_keywords(self, cluster_indices, top_n=6):
 
-        X = vectorizer.fit_transform(texts)
+        cluster_matrix = self.tfidf_matrix[cluster_indices]
 
-        scores = np.asarray(X.mean(axis=0)).ravel()
+        cluster_scores = np.asarray(cluster_matrix.mean(axis=0)).ravel()
 
-        terms = vectorizer.get_feature_names_out()
+        global_scores = np.asarray(self.tfidf_matrix.mean(axis=0)).ravel()
 
-        top_idx = scores.argsort()[-top_n:][::-1]
+        importance = cluster_scores - global_scores
 
-        return [terms[i] for i in top_idx]
+        top_idx = importance.argsort()[::-1]
+
+        keywords = []
+
+        generic_words = {
+            "service","good","bad","thing","things",
+            "experience","people","place","really",
+            "very","much"
+        }
+
+        for idx in top_idx:
+
+            term = self.feature_names[idx]
+
+            # skip generic terms
+            if term in generic_words:
+                continue
+
+            # prioritize phrases
+            if " " in term:
+                keywords.append(term)
+            else:
+                keywords.append(term)
+
+            if len(keywords) >= top_n:
+                break
+
+        return keywords
+
+    # ------------------------------------------------
+    # THEME NAME GENERATION
+    # ------------------------------------------------
+
+    def generate_theme_name(self, keywords):
+
+        if not keywords:
+            return "Other Feedback"
+
+        primary = keywords[0]
+        secondary = keywords[1] if len(keywords) > 1 else ""
+
+        phrase = f"{primary} {secondary}".strip()
+
+        phrase = phrase.replace("_", " ")
+
+        words = phrase.split()
+
+        # remove duplicates
+        words = list(dict.fromkeys(words))
+
+        theme = " ".join(words)
+
+        # clean formatting
+        theme = theme.title()
+
+        return theme
 
     # ------------------------------------------------
     # CLUSTER SUMMARY
@@ -156,13 +294,15 @@ class FeedbackInsightEngine:
 
         summary = {}
 
-        for cid in sorted(self.df["cluster"].unique()):
+        for cid in sorted(self.q_df["cluster"].unique()):
 
-            subset = self.df[self.df["cluster"] == cid]
+            subset = self.q_df[self.q_df["cluster"] == cid]
 
-            texts = subset[self.text_column].tolist()
+            texts = subset["clean_text"].tolist()
 
-            keywords = self.extract_keywords(texts)
+            indices = subset.index.tolist()
+
+            keywords = self.extract_keywords(indices)
 
             summary[cid] = {
 
@@ -186,9 +326,9 @@ class FeedbackInsightEngine:
 
         for cid, info in self.cluster_summary.items():
 
-            theme = ", ".join(info["keywords"][:2])
+            theme = self.generate_theme_name(info["keywords"])
 
-            subset = self.df[self.df["cluster"] == cid]
+            subset = self.q_df[self.q_df["cluster"] == cid]
 
             avg_sentiment = subset["sentiment"].mean()
 
@@ -199,23 +339,119 @@ class FeedbackInsightEngine:
             rows.append({
 
                 "Theme": theme,
-                "Response_Count": info["count"],
-                "Percentage (%)": pct,
+
+                "Response Count": info["count"],
+
+                "Share (%)": pct,
+
+                "Impact Score": round(severity, 2),
+
                 "Average Sentiment": round(avg_sentiment, 3),
-                "Severity Score": round(severity, 2),
-                "Top Keywords": ", ".join(info["keywords"]),
-                "Example Quote": info["samples"][0]
+
+                "Key Keywords": ", ".join(info["keywords"]),
+
+                "Representative Quote": info["samples"][0]
 
             })
 
         summary_df = pd.DataFrame(rows)
 
         summary_df = summary_df.sort_values(
-            "Severity Score",
+            "Impact Score",
             ascending=False
         )
 
         self.summary_df = summary_df
+
+    # ------------------------------------------------
+    # THEME SENTIMENT LABEL
+    # ------------------------------------------------
+
+    def classify_theme_sentiment(self):
+
+        labels = []
+
+        for score in self.summary_df["Average Sentiment"]:
+
+            if score < -0.1:
+                labels.append("Problem")
+
+            elif score > 0.1:
+                labels.append("Positive")
+
+            else:
+                labels.append("Neutral")
+
+        self.summary_df["Theme Sentiment"] = labels
+
+    # ------------------------------------------------
+    # MERGE SIMILAR THEMES
+    # ------------------------------------------------
+
+    def merge_similar_themes(self, similarity_threshold=0.75):
+
+        themes = self.summary_df["Theme"].tolist()
+
+        if len(themes) <= 1:
+            return
+
+        embeddings = self.model.encode(
+            themes,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+
+        merged_map = {}
+
+        used = set()
+
+        for i, theme_i in enumerate(themes):
+
+            if i in used:
+                continue
+
+            merged_map[theme_i] = [i]
+
+            for j in range(i + 1, len(themes)):
+
+                if j in used:
+                    continue
+
+                sim = np.dot(embeddings[i], embeddings[j])
+
+                if sim >= similarity_threshold:
+
+                    merged_map[theme_i].append(j)
+                    used.add(j)
+
+        new_rows = []
+
+        for main_theme, idxs in merged_map.items():
+
+            subset = self.summary_df.iloc[idxs]
+
+            combined = {
+
+                "Theme": main_theme,
+                "Response Count": subset["Response Count"].sum(),
+                "Share (%)": subset["Share (%)"].sum(),
+                "Impact Score": subset["Impact Score"].sum(),
+                "Average Sentiment": subset["Average Sentiment"].mean(),
+                "Key Keywords": ", ".join(subset["Key Keywords"].tolist()),
+                "Representative Quote": subset["Representative Quote"].iloc[0],
+                "Recommendation": subset["Recommendation"].iloc[0],
+                "Priority": subset["Priority"].iloc[0]
+
+            }
+
+            new_rows.append(combined)
+
+        self.summary_df = pd.DataFrame(new_rows)
+
+        self.summary_df = self.summary_df.sort_values(
+            "Impact Score",
+            ascending=False
+        )
 
     # ------------------------------------------------
     # RECOMMENDATIONS
@@ -255,7 +491,7 @@ class FeedbackInsightEngine:
 
             recs.append(rec)
 
-        self.summary_df["Recommendation"] = recs
+        self.summary_df.insert(5, "Recommendation", recs)
 
     #-------------------------------------------------
     # INSIGHT GENERATION
@@ -269,7 +505,7 @@ class FeedbackInsightEngine:
 
         insights.append(
             f"The most common issue reported by respondents is '{top['Theme']}', "
-            f"mentioned in {top['Percentage (%)']}% of responses."
+            f"mentioned in {top['Share (%)']}% of responses."
         )
 
         negative = self.summary_df.sort_values("Average Sentiment").iloc[0]
@@ -296,7 +532,7 @@ class FeedbackInsightEngine:
 
         priorities = []
 
-        for score in self.summary_df["Severity Score"]:
+        for score in self.summary_df["Impact Score"]:
 
             if score > 20:
                 priorities.append("High Priority")
@@ -307,7 +543,7 @@ class FeedbackInsightEngine:
             else:
                 priorities.append("Low Priority")
 
-        self.summary_df["Priority"] = priorities
+        self.summary_df.insert(4, "Priority", priorities)
 
     #-------------------------------------------------
     # DATASET SUMMARY
@@ -315,9 +551,11 @@ class FeedbackInsightEngine:
 
     def generate_dataset_summary(self):
 
-        total = len(self.df)
+        total = len(self.q_df)
 
-        avg_length = self.df[self.text_column].apply(lambda x: len(str(x).split())).mean()
+        avg_length = self.q_df["clean_text"].apply(
+            lambda x: len(str(x).split())
+        ).mean()
 
         self.dataset_summary = {
             "Total Responses": total,
@@ -334,9 +572,9 @@ class FeedbackInsightEngine:
         theme_map = {}
 
         for cid, info in self.cluster_summary.items():
-            theme_map[cid] = ", ".join(info["keywords"][:2])
+            theme_map[cid] = self.generate_theme_name(info["keywords"])
 
-        self.df["Theme"] = self.df["cluster"].map(theme_map)
+        self.q_df["Theme"] = self.q_df["cluster"].map(theme_map)
 
     # ------------------------------------------------
     # EXCEL STYLE HELPERS
@@ -395,38 +633,96 @@ class FeedbackInsightEngine:
         wb = Workbook()
         wb.remove(wb.active)
 
+        # ------------------------------------------------
+        # DASHBOARD
+        # ------------------------------------------------
+
+        ws = wb.create_sheet("Dashboard")
+
+        ws["A1"] = "Customer Feedback Insights Dashboard"
+        ws["A1"].font = Font(size=20, bold=True)
+
+        ws["A3"] = "Total Responses"
+        ws["B3"] = self.dataset_summary["Total Responses"]
+
+        ws["A4"] = "Themes Identified"
+        ws["B4"] = self.dataset_summary["Themes Identified"]
+
+        ws["A6"] = "Top Issues"
+        ws["A6"].font = Font(size=14, bold=True)
+
+        top_themes = self.summary_df.head(5)
+        problems = self.summary_df[
+        self.summary_df["Theme Sentiment"] == "Problem"
+        ].head(5)
+
+        positives = self.summary_df[
+        self.summary_df["Theme Sentiment"] == "Positive"
+        ].head(5)
+
+        ws.append([])
+        ws.append(["Theme", "Response Count", "Share (%)", "Priority"])
+
+        for r in top_themes[
+            ["Theme", "Response Count", "Share (%)", "Priority"]
+        ].itertuples(index=False):
+
+            ws.append(list(r))
+
+        self.style_header(ws)
+        self.zebra_rows(ws)
+        self.auto_width(ws)
+
+        # Dashboard Chart
+
+        data = Reference(
+            ws,
+            min_col=2,
+            min_row=8,
+            max_row=8 + len(top_themes)
+        )
+
+        cats = Reference(
+            ws,
+            min_col=1,
+            min_row=9,
+            max_row=8 + len(top_themes)
+        )
+
+        bar = BarChart()
+        bar.title = "Top Issues by Responses"
+        bar.y_axis.title = "Responses"
+
+        bar.add_data(data, titles_from_data=True)
+        bar.set_categories(cats)
+
+        ws.add_chart(bar, "F6")
+
+        # ------------------------------------------------
         # EXECUTIVE SUMMARY
+        # ------------------------------------------------
 
         ws = wb.create_sheet("Executive Summary")
 
         ws["A1"] = "Customer Feedback Insights Report"
         ws["A1"].font = Font(size=20, bold=True)
 
-        ws.merge_cells("A1:E1")
+        ws.merge_cells("A1:F1")
 
-        # DATASET OVERVIEW
+        ws["A3"] = "Dataset Overview"
+        ws["A3"].font = Font(size=14, bold=True)
 
-        ws["A3"] = "Total Responses"
-        ws["B3"] = self.dataset_summary["Total Responses"]
+        ws["A5"] = "Total Responses"
+        ws["B5"] = self.dataset_summary["Total Responses"]
 
-        ws["A4"] = "Average Response Length"
-        ws["B4"] = self.dataset_summary["Average Response Length"]
+        ws["A6"] = "Average Response Length"
+        ws["B6"] = self.dataset_summary["Average Response Length"]
 
-        ws["A5"] = "Themes Identified"
-        ws["B5"] = self.dataset_summary["Themes Identified"]
+        ws["A7"] = "Themes Identified"
+        ws["B7"] = self.dataset_summary["Themes Identified"]
 
-        # TOP INSIGHTS
-
-        ws["A7"] = "Top Issue"
-        ws["B7"] = self.summary_df.iloc[0]["Theme"]
-
-        ws["A8"] = "Most Severe Issue"
-        ws["B8"] = self.summary_df.iloc[0]["Theme"]
-
-        # KEY INSIGHTS SECTION
-
-        ws["A10"] = "Key Insights"
-        ws["A10"].font = Font(bold=True)
+        ws["A9"] = "Key Insights"
+        ws["A9"].font = Font(size=14, bold=True)
 
         row = 11
 
@@ -435,15 +731,64 @@ class FeedbackInsightEngine:
             row += 1
 
         self.auto_width(ws)
+        
+        ws["A15"] = "Top Customer Problems"
+        ws["A15"].font = Font(size=14, bold=True)
 
+        row = 17
+
+        for r in problems[
+            ["Theme","Response Count","Share (%)"]
+        ].itertuples(index=False):
+
+            ws[f"A{row}"] = r[0]
+            ws[f"B{row}"] = r[1]
+            ws[f"C{row}"] = r[2]
+
+            row += 1
+            
+        ws["F15"] = "Top Positive Feedback"
+        ws["F15"].font = Font(size=14, bold=True)
+
+        row = 17
+
+        for r in positives[
+            ["Theme","Response Count","Share (%)"]
+        ].itertuples(index=False):
+
+            ws[f"F{row}"] = r[0]
+            ws[f"G{row}"] = r[1]
+            ws[f"H{row}"] = r[2]
+
+            row += 1
+
+        # ------------------------------------------------
         # THEME ANALYSIS
+        # ------------------------------------------------
 
         ws = wb.create_sheet("Theme Analysis")
 
-        ws.append(self.summary_df.columns.tolist())
+        columns = [
+            "Theme",
+            "Response Count",
+            "Share (%)",
+            "Impact Score",
+            "Priority",
+            "Recommendation",
+            "Representative Quote",
+            "Key Keywords",
+            "Average Sentiment"
+        ]
 
-        for r in self.summary_df.itertuples(index=False):
+        ws.append(columns)
+
+        for r in self.summary_df[columns].itertuples(index=False):
             ws.append(list(r))
+
+        # wrap quote column
+        for row in ws.iter_rows(min_row=2, min_col=7, max_col=7):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True)
 
         self.style_header(ws)
         self.zebra_rows(ws)
@@ -452,14 +797,19 @@ class FeedbackInsightEngine:
 
         self.auto_width(ws)
 
+        # ------------------------------------------------
         # CHARTS
+        # ------------------------------------------------
 
         ws = wb.create_sheet("Charts")
 
-        ws.append(["Theme", "Responses"])
+        ws.append(["Theme", "Response Count"])
 
-        for r in self.summary_df[["Theme", "Response_Count"]].itertuples(index=False):
-            ws.append(r)
+        for r in self.summary_df[
+            ["Theme", "Response Count"]
+        ].itertuples(index=False):
+
+            ws.append(list(r))
 
         data = Reference(ws, min_col=2, min_row=1, max_row=len(self.summary_df) + 1)
         cats = Reference(ws, min_col=1, min_row=2, max_row=len(self.summary_df) + 1)
@@ -471,7 +821,7 @@ class FeedbackInsightEngine:
         bar.add_data(data, titles_from_data=True)
         bar.set_categories(cats)
 
-        ws.add_chart(bar, "D2")
+        ws.add_chart(bar, "E2")
 
         pie = PieChart()
         pie.title = "Theme Share"
@@ -479,9 +829,13 @@ class FeedbackInsightEngine:
         pie.add_data(data, titles_from_data=True)
         pie.set_categories(cats)
 
-        ws.add_chart(pie, "D20")
+        ws.add_chart(pie, "E20")
 
+        self.auto_width(ws)
+
+        # ------------------------------------------------
         # EXAMPLE QUOTES
+        # ------------------------------------------------
 
         ws = wb.create_sheet("Example Quotes")
 
@@ -489,23 +843,29 @@ class FeedbackInsightEngine:
 
         for cid, info in self.cluster_summary.items():
 
-            theme = ", ".join(info["keywords"][:2])
+            theme = self.generate_theme_name(info["keywords"])
 
             for q in info["samples"]:
                 ws.append([theme, q])
+
+        for row in ws.iter_rows(min_row=2, min_col=2, max_col=2):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True)
 
         self.style_header(ws)
         self.zebra_rows(ws)
 
         self.auto_width(ws)
 
+        # ------------------------------------------------
         # FULL DATA
+        # ------------------------------------------------
 
         ws = wb.create_sheet("Clustered Responses")
 
-        ws.append(self.df.columns.tolist())
+        ws.append(self.q_df.columns.tolist())
 
-        for r in self.df.itertuples(index=False):
+        for r in self.q_df.itertuples(index=False):
             ws.append(list(r))
 
         self.style_header(ws)
@@ -524,50 +884,77 @@ class FeedbackInsightEngine:
 
     def run(self):
 
-        print("Cleaning text...")
-        self.preprocess()
+        for column in self.text_columns:
 
-        print("Sentiment analysis...")
-        self.compute_sentiment()
+            print(f"\nAnalyzing question: {column}")
 
-        print("Generating embeddings...")
-        self.create_embeddings()
+            # create question dataframe
+            self.q_df = self.df[[column]].copy()
+            self.q_df.columns = ["response"]
 
-        print("Clustering responses...")
-        self.cluster_feedback()
+            print("Cleaning text...")
+            self.preprocess()
 
-        print("Building cluster summary...")
-        self.build_cluster_summary()
+            print("Building TF-IDF...")
+            self.build_tfidf_matrix()
 
-        print("Generating insights...")
-        self.build_summary_table()
+            print("Sentiment analysis...")
+            self.compute_sentiment()
 
-        print("Adding priority labels...")
-        self.add_priority_labels()
+            print("Generating embeddings...")
+            self.create_embeddings()
 
-        print("Generating recommendations...")
-        self.generate_recommendations()
+            print("Clustering responses...")
+            self.cluster_feedback()
 
-        print("Generating key insights...")
-        self.generate_key_insights()
+            print("Filtering clusters...")
+            self.filter_clusters()
 
-        print("Generating dataset summary...")
-        self.generate_dataset_summary()
+            print("Building cluster summary...")
+            self.build_cluster_summary()
 
-        print("Labeling responses...")
-        self.label_data()
+            print("Building summary table...")
+            self.build_summary_table()
+
+            print("Classifying theme sentiment...")
+            self.classify_theme_sentiment()
+
+            print("Generating insights...")
+            self.generate_key_insights()
+
+            print("Generating recommendations...")
+            self.generate_recommendations()
+
+            print("Adding priorities...")
+            self.add_priority_labels()
+
+            print("Merge similar themes...")
+            self.merge_similar_themes()
+
+            print("Dataset summary...")
+            self.generate_dataset_summary()
+
+            print("Labeling responses...")
+            self.label_data()
+
+            self.question_results[column] = {
+                "summary": self.summary_df.copy(),
+                "insights": self.key_insights.copy()
+            }
 
         print("Building Excel report...")
         self.build_excel_report()
 
-        print("Analysis complete.")
-
 # In[2]
 
 engine = FeedbackInsightEngine(
-"/home/churchil/Desktop/pythonfiles/env310/CustomerFeedbackInsight/health_survey_responses.csv",
-"response"
-)
+    "health_survey_responses.csv",
+    text_columns=[
+    "q1_service",
+    "q2_staff",
+    "q3_cost",
+    "q4_transport"
+    ])
 
 engine.run()
 # %%
