@@ -1,13 +1,15 @@
 <!DOCTYPE html>
 <html>
+
 <head>
+
 <title>NLP Survey & Customer Feedback Insights</title>
 
 <style>
 
 body{
 font-family: Arial, Helvetica, sans-serif;
-max-width: 900px;
+max-width:900px;
 margin:auto;
 line-height:1.6;
 padding:40px;
@@ -22,7 +24,7 @@ margin-bottom:10px;
 
 h2{
 color:#1F4E78;
-margin-top:30px;
+margin-top:35px;
 }
 
 .subtitle{
@@ -32,12 +34,12 @@ margin-bottom:30px;
 }
 
 .section{
-margin-bottom:35px;
+margin-bottom:40px;
 }
 
 .box{
 background:#f5f7fa;
-padding:18px;
+padding:20px;
 border-radius:6px;
 border-left:4px solid #1F4E78;
 }
@@ -65,15 +67,22 @@ color:#1F4E78;
 .cta{
 background:#1F4E78;
 color:white;
-padding:18px;
+padding:22px;
 border-radius:6px;
-margin-top:30px;
+margin-top:40px;
 }
 
 .footer{
-margin-top:40px;
+margin-top:50px;
 font-size:14px;
 color:#777;
+}
+
+.contact{
+background:#ffffff;
+border:1px solid #ddd;
+padding:18px;
+border-radius:6px;
 }
 
 </style>
@@ -85,8 +94,9 @@ color:#777;
 <h1>NLP-Powered Survey & Customer Feedback Analysis</h1>
 
 <p class="subtitle">
-Transform hundreds of open-ended responses into clear insights, themes, and actionable recommendations.
+Transform hundreds or thousands of open-ended responses into clear insights, themes, and actionable recommendations.
 </p>
+
 
 
 <div class="section">
@@ -94,11 +104,15 @@ Transform hundreds of open-ended responses into clear insights, themes, and acti
 <h2>The Problem</h2>
 
 <p>
-Organizations often collect hundreds or thousands of open-ended responses from surveys, customer feedback forms, or employee questionnaires.
+Organizations often collect large volumes of open-ended responses from surveys, customer feedback forms, employee questionnaires, or community assessments.
 </p>
 
 <p>
-Manually reviewing this feedback can take <span class="highlight">hours or even days</span>, and important patterns can easily be missed.
+Manually reading hundreds of responses can take <span class="highlight">hours or even days</span>, and identifying patterns across responses is difficult and inconsistent.
+</p>
+
+<p>
+As a result, valuable insights from surveys are often under-utilized.
 </p>
 
 </div>
@@ -110,11 +124,11 @@ Manually reviewing this feedback can take <span class="highlight">hours or even 
 <h2>The Solution</h2>
 
 <p>
-Using Natural Language Processing (NLP), responses are automatically analyzed and grouped into meaningful themes.
+Using Natural Language Processing (NLP), survey responses can be automatically analyzed to identify recurring issues, themes, and sentiment patterns.
 </p>
 
 <p>
-The system identifies recurring issues, extracts keywords, and generates a structured report with charts and insights.
+Instead of reading every response individually, the analysis groups feedback into meaningful categories and produces a structured report with charts, key insights, and recommendations.
 </p>
 
 </div>
@@ -123,18 +137,23 @@ The system identifies recurring issues, extracts keywords, and generates a struc
 
 <div class="section">
 
-<h2>What You Receive</h2>
+<h2>What This Service Provides</h2>
 
 <div class="box">
 
 <ul>
 
-<li>Executive summary of key findings</li>
 <li>Automatic grouping of responses into major themes</li>
-<li>Charts showing the distribution of issues</li>
-<li>Key insights derived from the feedback</li>
+
+<li>Detection of the most frequently mentioned issues</li>
+
+<li>Sentiment analysis to identify positive and negative feedback</li>
+
+<li>Extraction of representative quotes from respondents</li>
+
+<li>Clear charts showing distribution of feedback themes</li>
+
 <li>Strategic recommendations based on detected patterns</li>
-<li>Full dataset with categorized responses</li>
 
 </ul>
 
@@ -146,19 +165,27 @@ The system identifies recurring issues, extracts keywords, and generates a struc
 
 <div class="section">
 
-<h2>Example Insights</h2>
+<h2>Example Case Study</h2>
+
+<p>
+To demonstrate the system, a synthetic dataset representing community healthcare survey responses was analyzed.
+</p>
+
+<p>
+The dataset contained several hundred open-ended responses from respondents discussing their experiences accessing healthcare services.
+</p>
 
 <div class="results">
 
 <ul>
 
-<li><span class="highlight">27%</span> of respondents mentioned concerns about staff attitude</li>
+<li><span class="highlight">27%</span> of responses mentioned concerns about staff attitude</li>
 
-<li><span class="highlight">25%</span> reported transportation challenges reaching healthcare facilities</li>
+<li><span class="highlight">25%</span> highlighted transportation challenges reaching healthcare facilities</li>
 
-<li><span class="highlight">13%</span> mentioned long waiting times</li>
+<li><span class="highlight">13%</span> reported long waiting times</li>
 
-<li>Several responses highlighted challenges related to service costs</li>
+<li>Additional responses mentioned service costs and facility accessibility</li>
 
 </ul>
 
@@ -175,10 +202,14 @@ The system identifies recurring issues, extracts keywords, and generates a struc
 <ul>
 
 <li>NGO program evaluation surveys</li>
+
 <li>Community needs assessments</li>
+
 <li>Customer satisfaction surveys</li>
-<li>Employee feedback analysis</li>
-<li>Market research surveys</li>
+
+<li>Employee engagement surveys</li>
+
+<li>Market research feedback analysis</li>
 
 </ul>
 
@@ -191,20 +222,27 @@ The system identifies recurring issues, extracts keywords, and generates a struc
 <h2>How the Analysis Works</h2>
 
 <p>
-The system uses machine learning and NLP libraries including:
+Each project begins with a review of the survey dataset. In many cases the raw data requires light preparation before analysis (for example cleaning responses or standardizing formats).
+</p>
+
+<p>
+Once prepared, the responses are processed using an NLP analysis pipeline built with Python and machine learning techniques including:
 </p>
 
 <ul>
 
-<li>Python NLP models</li>
-<li>Sentence embeddings</li>
-<li>Clustering algorithms</li>
+<li>Sentence embeddings for semantic similarity</li>
+
+<li>Clustering algorithms to group similar responses</li>
+
+<li>Keyword extraction</li>
+
 <li>Sentiment analysis</li>
 
 </ul>
 
 <p>
-These techniques automatically detect patterns across large volumes of responses.
+The final result is a structured report that summarizes the key findings from the survey data.
 </p>
 
 </div>
@@ -216,16 +254,22 @@ These techniques automatically detect patterns across large volumes of responses
 <h2>Example Deliverable</h2>
 
 <p>
-The final output is a structured Excel report containing:
+The final output is a professional Excel report designed for decision-makers, including:
 </p>
 
 <ul>
 
-<li>Executive summary</li>
-<li>Theme analysis table</li>
-<li>Insight summary</li>
+<li>Executive summary of findings</li>
+
+<li>Theme analysis table with response counts</li>
+
 <li>Charts showing major feedback themes</li>
-<li>Example quotes from respondents</li>
+
+<li>Key insights derived from responses</li>
+
+<li>Representative quotes from respondents</li>
+
+<li>Strategic recommendations</li>
 
 </ul>
 
@@ -235,11 +279,31 @@ The final output is a structured Excel report containing:
 
 <div class="cta">
 
-<strong>Interested in analyzing your survey responses?</strong>
+<strong>Need help analyzing survey responses or customer feedback?</strong>
 
 <p>
-If your organization collects open-ended feedback and needs help extracting insights quickly, feel free to reach out for a demo.
+If your organization collects open-ended feedback and needs support extracting insights quickly and accurately, feel free to get in touch to discuss your dataset and analysis needs.
 </p>
+
+</div>
+
+
+
+<div class="section">
+
+<h2>Contact</h2>
+
+<div class="contact">
+
+<p><strong>Name:</strong> Churchil Omondi</p>
+
+<p><strong>Service:</strong> Data Science & NLP Feedback Analysis</p>
+
+<p><strong>Email:</strong> churchilradonji@gmail.com</p>
+
+<p><strong>Location:</strong> Nairobi, Kenya (Remote work available)</p>
+
+</div>
 
 </div>
 
@@ -254,4 +318,5 @@ NLP Survey Insights Analysis • Data Science & Natural Language Processing
 </div>
 
 </body>
+
 </html>
