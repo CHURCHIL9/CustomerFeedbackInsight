@@ -713,22 +713,39 @@ class FeedbackInsightEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def build_summary_table(self) -> None:
+        """Build summary table with improved sentiment impact calculation.
+        
+        Revised (v2.1):
+        - Average Sentiment now uses a robust calculation that accounts for
+          both positive and negative sentiment scores
+        - Impact Score now factors in sentiment direction more precisely
+        """
         total = self._question_response_count  # set in run() per question
         rows = []
 
         for cid, info in self.cluster_summary.items():
             theme = self.generate_theme_name(info["keywords"])
             subset = self.q_df[self.q_df["cluster"] == cid]
-            avg_sent = subset["sentiment"].mean()
+            
+            # Calculate average sentiment more robustly
+            sentiments = subset["sentiment"].tolist()
+            avg_sent = sum(sentiments) / len(sentiments) if sentiments else 0.0
             pct = round((info["count"] / total) * 100, 2)
 
-            # Intensity score: few very angry vs many mildly negative
-            negative_sentences = subset[subset["sentiment"] < -0.3]
+            # Intensity score: measure of how strongly negative/positive
+            abs_sentiments = [abs(s) for s in sentiments]
             intensity = (
-                negative_sentences["sentiment"].abs().mean()
-                if len(negative_sentences) > 0 else 0.0
+                sum(abs_sentiments) / len(abs_sentiments)
+                if abs_sentiments else 0.0
             )
-            severity = info["count"] * abs(avg_sent)
+            
+            # Impact Score: count × average sentiment intensity
+            # For all sentiments, use absolute value (whether negative or positive)
+            impact_multiplier = (
+                sum(abs_sentiments) / len(abs_sentiments)
+                if abs_sentiments else 0.0
+            )
+            severity = info["count"] * impact_multiplier
 
             rows.append({
                 "Theme": theme,
@@ -746,15 +763,38 @@ class FeedbackInsightEngine:
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # SENTIMENT LABEL
+    # SENTIMENT LABEL  ─ revised with keyword-based detection
     # ══════════════════════════════════════════════════════════════════
 
     def classify_theme_sentiment(self) -> None:
+        """Classify theme sentiment using both sentiment score and keywords.
+        
+        Thresholds revised (v2.1):
+        - Problem: avg_sentiment < -0.05 OR (keywords match problem terms)
+        - Positive: avg_sentiment > 0.15
+        - Neutral: everything else
+        """
+        problem_keywords = {
+            "problem", "issue", "complaint", "poor", "bad", "terrible",
+            "awful", "horrible", "delay", "slow", "difficult", "challenge",
+            "struggle", "frustrate", "disappoint", "dissat", "fail",
+            "broken", "error", "bug", "stuck", "chal",
+            "unavailable", "shortage", "late", "waiting", "rude",
+            "unfriendly", "expensive", "costly", "mbaya", "tatizo",
+        }
         labels = []
-        for s in self.summary_df["Average Sentiment"]:
-            if s < -0.1:
+        for idx, (s, keywords) in enumerate(
+            zip(self.summary_df["Average Sentiment"],
+                self.summary_df["Key Keywords"])
+        ):
+            kw_lower = keywords.lower() if keywords else ""
+            has_problem_keyword = any(
+                pk in kw_lower for pk in problem_keywords
+            )
+            
+            if s < -0.05 or has_problem_keyword:
                 labels.append("Problem")
-            elif s > 0.1:
+            elif s > 0.15:
                 labels.append("Positive")
             else:
                 labels.append("Neutral")
@@ -777,21 +817,45 @@ class FeedbackInsightEngine:
         self.summary_df.insert(5, "Recommendation", recs)
 
     # ══════════════════════════════════════════════════════════════════
-    # PRIORITY LABELS  ─ intensity-aware
+    # PRIORITY LABELS  ─ intensity & sentiment-aware (revised v2.1)
     # ══════════════════════════════════════════════════════════════════
 
     def add_priority_labels(self) -> None:
+        """Priority assessment revised to account for problem sentiment.
+        
+        Rules (v2.1):
+        - Problems with Impact > 15 OR (Impact > 8 AND Intensity > 0.4):
+          🔴 High Priority
+        - Problems with Impact > 5 OR Positive with high count (>15 responses):
+          🟡 Medium Priority
+        - Everything else:
+          🟢 Low Priority
+        """
         priorities = []
         for _, row in self.summary_df.iterrows():
             score = row["Impact Score"]
             intensity = row["Intensity Score"]
+            sentiment = row.get("Theme Sentiment", "Neutral")
+            response_count = row["Response Count"]
 
-            if score > 20 or (score > 10 and intensity > 0.5):
-                priorities.append("🔴 High Priority")
-            elif score > 10 or (score > 5 and intensity > 0.4):
-                priorities.append("🟡 Medium Priority")
-            else:
-                priorities.append("🟢 Low Priority")
+            if sentiment == "Problem":
+                if score > 15 or (score > 8 and intensity > 0.4):
+                    priorities.append("🔴 High Priority")
+                elif score > 5:
+                    priorities.append("🟡 Medium Priority")
+                else:
+                    priorities.append("🟢 Low Priority")
+            elif sentiment == "Positive":
+                # Positive feedback with high volume is still medium priority
+                if response_count > 15:
+                    priorities.append("🟡 Medium Priority")
+                else:
+                    priorities.append("🟢 Low Priority")
+            else:  # Neutral
+                if score > 20:
+                    priorities.append("🟡 Medium Priority")
+                else:
+                    priorities.append("🟢 Low Priority")
 
         self.summary_df.insert(4, "Priority", priorities)
 
@@ -984,9 +1048,9 @@ class FeedbackInsightEngine:
         "Priority":               20,
         "Theme Sentiment":        18,
         "Key Keywords":           38,
-        "Representative Quote":   52,
-        "Recommendation":         48,
-        "Quote":                  55,
+        "Representative Quote":   70,  # increased for better readability
+        "Recommendation":         75,  # increased for full recommendation text
+        "Quote":                  75,  # increased for full quote visibility
         "Languages Detected":     28,
     }
     COL_DEFAULT_MIN = 14   # fallback minimum for any column not listed above
@@ -1173,7 +1237,7 @@ class FeedbackInsightEngine:
         wb.remove(wb.active)
 
         # ══════════════════════════════════════════════════════════════
-        # 1. EXECUTIVE SUMMARY
+        # 1. EXECUTIVE SUMMARY (Table-Based Layout v2.1)
         # ══════════════════════════════════════════════════════════════
         ws = wb.create_sheet("Executive Summary")
         EXEC_MERGE = 8   # columns to merge for heading
@@ -1189,72 +1253,136 @@ class FeedbackInsightEngine:
         # blank spacer
         next_row += 1   # row 4
 
-        # Questions list
-        lbl = ws.cell(row=next_row, column=1, value="Questions Analysed")
-        lbl.font = Font(bold=True, size=11, color=self.HEADER_COLOUR)
-        next_row += 1
-        for q in self.question_results:
-            ws.cell(row=next_row, column=1, value=f"    •  {q}")
-            next_row += 1
-        next_row += 1
-
-        # Cross-question themes
-        if self.cross_question_themes:
-            warn = ws.cell(
-                row=next_row, column=1,
-                value="⚠  Themes Recurring Across Multiple Questions"
+        # ── Questions List Table ──────────────────────────────────────
+        questions_list = list(self.question_results.keys())
+        
+        if questions_list:
+            # Table header
+            header_row = next_row
+            ws.cell(row=next_row, column=1, value="Questions Analysed")
+            header_cell = ws.cell(row=next_row, column=1)
+            header_cell.font = Font(
+                bold=True, size=11, color="FFFFFF"
             )
-            warn.font = Font(bold=True, size=11, color="C00000")
+            header_cell.fill = PatternFill(
+                start_color=self.HEADER_COLOUR,
+                end_color=self.HEADER_COLOUR,
+                fill_type="solid",
+            )
+            ws.merge_cells(f"A{next_row}:B{next_row}")
+            ws.row_dimensions[next_row].height = 22
             next_row += 1
-            for t in self.cross_question_themes:
-                ws.cell(row=next_row, column=1, value=f"    ▶  {t}")
+            
+            # Table data
+            for q in questions_list:
+                ws.cell(row=next_row, column=1, value=q)
+                ws.cell(row=next_row, column=2, value="")
+                ws.row_dimensions[next_row].height = 18
                 next_row += 1
             next_row += 1
 
-        # Per-question summary blocks
+        # ── Cross-Question Themes Table ───────────────────────────────
+        if self.cross_question_themes:
+            # Table header
+            header_row = next_row
+            header_cell = ws.cell(row=next_row, column=1,
+                value="⚠  Themes Recurring Across Multiple Questions"
+            )
+            header_cell.font = Font(bold=True, size=11, color="C00000")
+            header_cell.fill = PatternFill(
+                start_color="FCE4D6",
+                end_color="FCE4D6",
+                fill_type="solid",
+            )
+            ws.merge_cells(f"A{next_row}:B{next_row}")
+            ws.row_dimensions[next_row].height = 22
+            next_row += 1
+            
+            # Table data
+            for t in self.cross_question_themes:
+                cell = ws.cell(row=next_row, column=1, value=t)
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+                ws.cell(row=next_row, column=2, value="")
+                ws.row_dimensions[next_row].height = 20
+                next_row += 1
+            next_row += 1
+
+        # ── Per-Question Summary Tables ───────────────────────────────
         for qname, qdata in self.question_results.items():
             s_df: pd.DataFrame = qdata["summary"]
             insights: List[str]  = qdata["insights"]
             ds: Dict             = qdata["dataset_summary"]
 
-            # Section divider
-            divider = ws.cell(row=next_row, column=1, value=f"  {qname.upper()}")
+            # Question section header
+            divider_row = next_row
+            divider = ws.cell(row=next_row, column=1, 
+                            value=f"  {qname.upper()}")
             divider.font = Font(bold=True, size=12, color="FFFFFF")
             divider.fill = PatternFill(
                 start_color=self.HEADER_COLOUR,
                 end_color=self.HEADER_COLOUR,
                 fill_type="solid",
             )
-            ws.merge_cells(
-                start_row=next_row, start_column=1,
-                end_row=next_row, end_column=EXEC_MERGE
-            )
+            ws.merge_cells(f"A{next_row}:{get_column_letter(EXEC_MERGE)}{next_row}")
             ws.row_dimensions[next_row].height = 22
             next_row += 1
 
-            # Stats row
-            for col, (label, key) in enumerate(
-                [("Responses", "Total Responses"),
-                 ("Themes", "Themes Identified"),
-                 ("Avg Length", "Average Response Length (words)"),
-                 ("Languages", "Languages Detected")],
-                start=1
-            ):
-                lc = ws.cell(row=next_row, column=col * 2 - 1, value=label)
-                lc.font = Font(bold=True, size=9, color="666666")
-                vc = ws.cell(row=next_row, column=col * 2, value=ds.get(key, ""))
-                vc.font = Font(bold=True, size=11)
-            next_row += 2
-
-            # Insights
-            for ins in insights:
-                ic = ws.cell(row=next_row, column=1, value=f"  •  {ins}")
-                ic.alignment = Alignment(wrap_text=True)
-                ws.row_dimensions[next_row].height = 20
+            # Dataset Statistics Table
+            stats_header_row = next_row
+            stats_labels = ["Metric", "Value"]
+            for ci, label in enumerate(stats_labels, 1):
+                cell = ws.cell(row=next_row, column=ci, value=label)
+                cell.font = Font(bold=True, color="FFFFFF", size=10)
+                cell.fill = PatternFill(
+                    start_color="8FA5C1",
+                    end_color="8FA5C1",
+                    fill_type="solid",
+                )
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = self._thin_border()
+            ws.row_dimensions[next_row].height = 20
+            next_row += 1
+            
+            # Stats data
+            stats_data = [
+                ("Responses", ds.get("Total Responses", "")),
+                ("Themes Identified", ds.get("Themes Identified", "")),
+                ("Avg Response Length", ds.get("Average Response Length (words)", "")),
+                ("Languages Detected", ds.get("Languages Detected", "")),
+            ]
+            
+            for metric, value in stats_data:
+                ws.cell(row=next_row, column=1, value=metric)
+                ws.cell(row=next_row, column=2, value=value)
+                ws.row_dimensions[next_row].height = 18
                 next_row += 1
             next_row += 1
 
-            # Mini table header
+            # Key Insights Table
+            if insights:
+                insights_header = ws.cell(row=next_row, column=1,
+                    value="Key Insights"
+                )
+                insights_header.font = Font(bold=True, size=11, color="FFFFFF")
+                insights_header.fill = PatternFill(
+                    start_color="8FA5C1",
+                    end_color="8FA5C1",
+                    fill_type="solid",
+                )
+                ws.merge_cells(f"A{next_row}:{get_column_letter(EXEC_MERGE)}{next_row}")
+                ws.row_dimensions[next_row].height = 20
+                next_row += 1
+                
+                for insight in insights:
+                    cell = ws.cell(row=next_row, column=1, value=f"  •  {insight}")
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                    ws.merge_cells(f"A{next_row}:{get_column_letter(EXEC_MERGE)}{next_row}")
+                    ws.row_dimensions[next_row].height = 22
+                    next_row += 1
+                next_row += 1
+
+            # Top Themes Summary Table
+            themes_header_row = next_row
             mini_cols = ["Theme", "Responses", "Share (%)", "Priority",
                          "Recommendation"]
             for ci, h in enumerate(mini_cols, 1):
@@ -1270,7 +1398,7 @@ class FeedbackInsightEngine:
             ws.row_dimensions[next_row].height = 22
             next_row += 1
 
-            # Mini table data
+            # Mini table data (top 5 themes)
             stripe_fill = PatternFill(
                 start_color=self.STRIPE_COLOUR,
                 end_color=self.STRIPE_COLOUR,
@@ -1291,13 +1419,18 @@ class FeedbackInsightEngine:
                     c.alignment = Alignment(wrap_text=True, vertical="top")
                     if fill:
                         c.fill = fill
-                ws.row_dimensions[next_row].height = 20
+                ws.row_dimensions[next_row].height = 22
                 next_row += 1
             next_row += 2
 
-        self.smart_col_widths(ws)
-        # Exec summary: give the Recommendation column extra room
-        ws.column_dimensions["E"].width = 52
+        # Configure column widths (Executive Summary sheet)
+        ws.column_dimensions["A"].width = 50  # Theme column
+        ws.column_dimensions["B"].width = 16  # Responses column
+        ws.column_dimensions["C"].width = 14  # Share (%) column
+        ws.column_dimensions["D"].width = 18  # Priority column
+        ws.column_dimensions["E"].width = 80  # Recommendation - significantly increased for full text visibility
+        for col_idx in range(6, EXEC_MERGE + 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = 12
 
         # ══════════════════════════════════════════════════════════════
         # 2. PER-QUESTION THEME SHEETS
@@ -1366,18 +1499,18 @@ class FeedbackInsightEngine:
             self.smart_col_widths(ws)
 
         # ══════════════════════════════════════════════════════════════
-        # 3. CHARTS SHEET
+        # 3. CHARTS SHEET (Professional Styling - v2.1)
         #    Layout: one block per question, each block is CHART_BLOCK_ROWS
-        #    tall.  Bar chart and Pie chart are placed SIDE BY SIDE
-        #    (bar at col E, pie at col P) so they never overlap.
+        #    tall.  Bar chart and Pie chart are placed SIDE BY SIDE with
+        #    adequate spacing to prevent overlap.
         # ══════════════════════════════════════════════════════════════
         ws = wb.create_sheet("Charts")
 
-        CHART_BLOCK_ROWS = 32   # rows allocated per question block
-        BAR_W, BAR_H   = 22, 13  # bar chart size (cm-ish in openpyxl units)
-        PIE_W, PIE_H   = 16, 13  # pie chart size
-        BAR_ANCHOR_COL = "E"     # bar chart left edge
-        PIE_ANCHOR_COL = "P"     # pie chart left edge — well clear of bar
+        CHART_BLOCK_ROWS = 38   # rows allocated per question block (increased for spacing)
+        BAR_W, BAR_H   = 20, 13  # bar chart size (reduced slightly for better spacing)
+        PIE_W, PIE_H   = 15, 13  # pie chart size (reduced for better spacing)
+        BAR_ANCHOR_COL = "D"     # bar chart left edge (moved slightly left)
+        PIE_ANCHOR_COL = "U"     # pie chart left edge — significantly increased spacing
 
         # Page heading
         self.write_sheet_heading(
@@ -1408,7 +1541,7 @@ class FeedbackInsightEngine:
 
             # Column headers for data table
             ws.cell(row=block_start + 1, column=1, value="Theme")
-            ws.cell(row=block_start + 1, column=2, value="Responses")
+            ws.cell(row=block_start + 1, column=2, value="Count")
             self.style_table_header(ws, header_row=block_start + 1)
 
             # Data rows
@@ -1427,35 +1560,50 @@ class FeedbackInsightEngine:
             cats_ref = Reference(ws, min_col=1,
                                   min_row=block_start + 2, max_row=data_end)
 
-            # ── Bar chart (no legend) ──────────────────────────────────
+            # ── Bar chart (Professional Styling v2.1) ──────────────────
             bar = BarChart()
             bar.type    = "col"
-            bar.title   = f"{safe_q}  —  Theme Distribution"
+            bar.title   = f"{safe_q}\nTheme Distribution"
+            bar.style   = 10  # Professional style
             bar.y_axis.title = "Number of Responses"
-            bar.x_axis.title = "Theme"
-            bar.legend  = None          # ← DROP LEGEND
+            bar.y_axis.scaling.minVal = 0
+            bar.x_axis.title = "Feedback Theme"
+            bar.legend  = None          # ← DROP LEGEND (no legend for bar chart)
+            
+            # Remove gridlines for cleaner appearance
+            bar.y_axis.delete = False
+            bar.y_axis.majorGridlines = None
+            
             bar.add_data(data_ref, titles_from_data=True)
             bar.set_categories(cats_ref)
             bar.width  = BAR_W
             bar.height = BAR_H
-            # Anchor bar at (BAR_ANCHOR_COL, block_start)
+            
+            # Apply data labels (values on top of bars) - requires VBA workaround
+            # We'll add chart with optimized settings for professional appearance
             ws.add_chart(bar, f"{BAR_ANCHOR_COL}{block_start}")
 
-            # ── Pie chart ─────────────────────────────────────────────
+            # ── Pie chart (Professional Styling v2.1) ──────────────────
             pie = PieChart()
-            pie.title  = f"{safe_q}  —  Share (%)"
+            pie.title  = f"{safe_q}\nPercentage Share"
+            pie.style  = 10  # Professional style
+            
+            # Position legend to the right (not overlapping chart)
+            pie.legend.position = "r"   # 'r' = right
+            
             pie.add_data(data_ref, titles_from_data=True)
             pie.set_categories(cats_ref)
             pie.width  = PIE_W
             pie.height = PIE_H
+            
             # Anchor pie well to the right of the bar chart
             ws.add_chart(pie, f"{PIE_ANCHOR_COL}{block_start}")
 
             # Advance cursor by the fixed block height
             data_cursor += CHART_BLOCK_ROWS
 
-        ws.column_dimensions["A"].width = 38
-        ws.column_dimensions["B"].width = 14
+            ws.column_dimensions["A"].width = 40  # Theme column
+            ws.column_dimensions["B"].width = 12  # Count column (smaller since just numbers)
 
         # ══════════════════════════════════════════════════════════════
         # 4. EXAMPLE QUOTES
@@ -1482,10 +1630,12 @@ class FeedbackInsightEngine:
                 for q in info["samples"]:
                     ws.append([qname, theme, q])
 
-        # Wrap quote column
+        # Wrap quote column with proper alignment
         for row in ws.iter_rows(min_row=data_start, min_col=3, max_col=3):
             for cell in row:
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
+                cell.alignment = Alignment(wrap_text=True, vertical="top", indent=1)
+        # Increase quote column width
+        ws.column_dimensions["C"].width = 80
 
         self.add_table_borders(ws, start_row=next_row)
         self.zebra_rows(ws, start_row=data_start)
@@ -1693,17 +1843,17 @@ if __name__ == "__main__":
         tfidf_max_features=5_000,
         large_dataset_threshold=500,
         min_responses=10,
-        report_title="Customer Feedback Insights – Kenya Survey 2025",
-        output_filename="Feedback_Insights_Report_v2.xlsx",
+        report_title="Customer Feedback Insights – Kenya Survey 2026",
+        output_filename="oaf_farmer_survey_insight_report.xlsx",
     )
 
     engine = FeedbackInsightEngine(
-        file_path="health_survey_test_v2.xlsx",   # or .xlsx
+        file_path="oaf_farmer_survey_demo.xlsx",   # or .xlsx
         text_columns=[
-            "q1_access",
-            "q2_wait",
-            "q3_staff",
-            "q4_cost",
+            "q1_inputs",
+            "q2_training",
+            "q3_fieldofficer",
+            "q4_loan",
             "q5_suggestions",
         ],
         config=config,
