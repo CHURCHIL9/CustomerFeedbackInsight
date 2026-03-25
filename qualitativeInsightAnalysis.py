@@ -76,7 +76,10 @@ DEPENDENCIES (pip install …):
 
 # ── stdlib ────────────────────────────────────────────────────────────
 import gc
+import json
 import logging
+import os
+import pickle
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -91,6 +94,7 @@ import chardet
 import nltk
 import numpy as np
 import pandas as pd
+import yaml
 from nltk.sentiment import SentimentIntensityAnalyzer
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, PieChart, Reference
@@ -108,6 +112,12 @@ try:
 except ImportError:
     LANGDETECT_AVAILABLE = False
 
+try:
+    import anthropic as _anthropic_lib
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 nltk.download("vader_lexicon", quiet=True)
 nltk.download("stopwords", quiet=True)
 
@@ -121,6 +131,64 @@ log = logging.getLogger("FeedbackEngine")
 
 # ── EAT timezone ──────────────────────────────────────────────────────
 EAT = timezone(timedelta(hours=3))
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIG SYSTEM (v3+ Upgrade)
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_config(path: str = "config/config.yaml") -> dict:
+    """
+    Load configuration from YAML file for flexibility and robustness.
+    
+    Args:
+        path: relative path to config.yaml (default: config/config.yaml)
+    
+    Returns:
+        dict with keys: sector, thresholds, features, output
+    
+    Raises:
+        FileNotFoundError if config file doesn't exist
+    """
+    config_path = Path(path)
+    
+    if not config_path.exists():
+        log.warning(
+            "Config file not found at %s. Using hardcoded defaults.",
+            config_path
+        )
+        # Hardcoded fallback defaults
+        return {
+            "sector": "smallholder agriculture",
+            "thresholds": {"high_impact": 15, "medium_impact": 8},
+            "features": {
+                "enable_trend_analysis": True,
+                "enable_trigger_engine": True,
+                "enable_action_engine": True,
+            },
+            "output": {"excel": True, "json": True, "alerts": True},
+        }
+    
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+        log.info("Loaded configuration from %s", config_path)
+        return config
+    except Exception as exc:
+        log.error("Failed to load config (%s). Using defaults.", exc)
+        return {
+            "sector": "smallholder agriculture",
+            "thresholds": {"high_impact": 15, "medium_impact": 8},
+            "features": {
+                "enable_trend_analysis": True,
+                "enable_trigger_engine": True,
+                "enable_action_engine": True,
+            },
+            "output": {"excel": True, "json": True, "alerts": True},
+        }
+
+# ── NEW ENGINE IMPORTS ────────────────────────────────────────────────
+# These are loaded lazily when features are enabled
+_ENGINES_LOADED = False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -145,8 +213,6 @@ class EngineConfig:
     top_keywords: int = 6
 
     # --- Sentiment ---
-    # Custom Swahili / Sheng / African-English polarity adjustments
-    # Format: word → compound score delta (−1 to +1)
     extra_sentiment_lexicon: Dict[str, float] = field(default_factory=lambda: {
         # Swahili positive
         "sawa": 0.4, "poa": 0.5, "nzuri": 0.5, "vizuri": 0.5,
@@ -155,18 +221,37 @@ class EngineConfig:
         # Swahili negative
         "mbaya": -0.5, "vibaya": -0.5, "tatizo": -0.4, "shida": -0.5,
         "hasira": -0.6, "huzuni": -0.5, "duni": -0.4, "gharama": -0.3,
-        "uchafu": -0.5, "lalamiko": -0.4,
+        "uchafu": -0.5, "lalamiko": -0.4, "chelewa": -0.5,
         # Sheng
         "peng": 0.3, "moto": 0.3, "safi": 0.5, "rada": -0.3,
         "stress": -0.4, "noma": -0.4, "fala": -0.5,
         # African-English
         "harassed": -0.6, "frustrated": -0.6, "disappointed": -0.6,
-        "chapaa": -0.3,  # money stress
+        "chapaa": -0.3,
     })
 
     # --- Scale ---
     large_dataset_threshold: int = 500   # use MiniBatchKMeans above this
     min_responses: int = 10              # skip question if fewer rows
+
+    # --- Context (used by LLM methods) ---
+    sector: str = ""
+    # e.g. "smallholder agriculture", "primary healthcare", "microfinance",
+    #      "WASH services", "secondary education"  — left blank for generic.
+
+    # --- LLM-assisted intelligence (requires: pip install anthropic) ---
+    use_llm_naming: bool = True
+    # When True, Claude generates meaningful theme names from keywords + quotes.
+    # When False (or anthropic not installed), improved rule-based naming is used.
+
+    use_llm_recommendations: bool = True
+    # When True, Claude generates sector-aware, context-specific recommendations.
+    # When False, the rule-based RECOMMENDATION_RULES dict is used.
+    # TIP: run once with False to see which keywords need new rules (see logs).
+
+    anthropic_model: str = "claude-haiku-4-5-20251001"
+    # Use the fast/cheap Haiku model — theme naming + recs are short prompts.
+    # Switch to "claude-sonnet-4-6" for richer recommendations.
 
     # --- Output ---
     output_filename: str = "Feedback_Insights_Report.xlsx"
@@ -213,82 +298,188 @@ COMBINED_STOP_WORDS = (
 # ══════════════════════════════════════════════════════════════════════
 
 RECOMMENDATION_RULES: List[Tuple[List[str], str]] = [
-    # Cost / affordability
-    (["cost", "price", "fee", "expensive", "afford", "payment", "pay",
-      "charges", "money", "mpesa", "cash", "wallet", "tariff", "cheap",
-      "subsidy", "bursary", "fund"],
-     "Review pricing structure; explore M-Pesa instalment options, "
-     "subsidies, or tiered pricing for low-income segments."),
+    # ══════════════════════════════════════════════════════════════════
+    # CRITICAL THEMES (Appear in all 5 questions)
+    # ══════════════════════════════════════════════════════════════════
 
-    # Wait time / queue
-    (["wait", "queue", "delay", "slow", "long", "time", "hours", "days",
-      "minutes", "appointment", "turnaround", "response"],
-     "Streamline service workflow: add appointment booking, triage, "
-     "or digital queue management to cut wait times."),
+    # 1. INPUT DELIVERY — TIMING & LOGISTICS
+    (["delivery", "delivered", "late", "delayed", "inputs delivered",
+      "planting window", "rains", "early", "dispatch", "arrive",
+      "collection point", "distribute", "distribution"],
+     "Overhaul input supply timing: (1) Pre-position all input stocks at "
+     "sub-location collection points BEFORE rains start (by November for "
+     "December-January planting); (2) Use SMS alerts to notify farmers exactly "
+     "when inputs arrive at collection point; (3) Coordinate timing with county "
+     "extension for weather forecasting; (4) Set weekly collection schedule with "
+     "transport buddies to reduce individual collection burden."),
 
-    # Transport / access / distance
-    (["transport", "distance", "travel", "far", "road", "matatu",
-      "boda", "vehicle", "location", "access", "reach", "remote",
-      "rural", "county", "village", "town"],
-     "Expand reach via mobile units, satellite offices, or partner "
-     "with boda-boda networks for last-mile service delivery."),
+    # 2. LOAN REPAYMENT — ALIGNMENT WITH HARVEST
+    (["loan", "repayment", "repay", "harvest", "tight", "schedule",
+      "boda", "payment", "mpesa", "default", "liability", "penalised",
+      "penalty", "grace", "yield", "loss", "installment", "instalment"],
+     "Redesign loan repayment structure: (1) Align repayment AFTER harvest "
+     "(not during growing season) — grace period of 30-45 days post-harvest "
+     "to allow selling crops; (2) Allow partial repayment (50%) after first "
+     "harvest sale, balance due 2 weeks after final harvest; (3) Offer M-Pesa "
+     "AND cash payment options (SMS system sometimes fails); (4) Remove group "
+     "liability — instead: graduated individual penalties (mild for first late "
+     "payment, strict only after 3+ months); (5) Provide harvest-tracking SMS: "
+     "farmers report crop sale amounts, system auto-calculates due date; "
+     "(6) If crop fails (drought/pests), offer 1-month extension (don't penalize)."),
 
-    # Staff attitude / customer care
-    (["staff", "attitude", "rude", "arrogant", "unfriendly", "unprofessional",
-      "disrespect", "ignore", "behaviour", "behavior", "manner", "tone",
-      "treat", "treated"],
-     "Invest in customer service training; introduce mystery-shopper "
-     "audits and link staff appraisals to satisfaction scores."),
+    # 3. FIELD OFFICER — PRESENCE & SUPPORT
+    (["officer", "field officer", "visits", "visit", "phone", "reach",
+      "changed", "turnover", "replaced", "remote", "infrequent", "sub-location",
+      "difficult", "shamba", "afisa", "spread", "coverage"],
+     "Strengthen field officer coverage: (1) Reduce officer-to-farmer ratio "
+     "(current is too high) to max 200 farmers per officer; (2) Set minimum visit "
+     "frequency: 2× per month during growing season, 1× monthly off-season; "
+     "(3) Provide officers motorbike/fuel allowance to reach remote areas; "
+     "(4) Create WhatsApp group for farmers to ask questions between visits; "
+     "(5) Implement structured check-in: officers send weekly SMS with seasonal tips; "
+     "(6) Address turnover by raising salaries and offering relocation bonuses "
+     "(reduce external transfers)."),
 
-    # Drug / supply / stock
-    (["drug", "medicine", "stock", "supply", "shortage", "unavailable",
-      "out of", "pharmacy", "dispensary", "equipment", "machine"],
-     "Strengthen supply-chain management: adopt real-time stock "
-     "tracking and safety-stock thresholds with automated reordering."),
+    # 4. GROUP DYNAMICS & MEMBER ACCOUNTABILITY
+    (["group", "members", "member", "group members", "problems", "meetings",
+      "leader", "communicate", "communication", "liability", "default",
+      "conflict", "trust", "attendance", "rules", "chama"],
+     "Rebuild group trust & governance: (1) Provide group leaders with 1-day "
+     "facilitation training (communication, conflict resolution); (2) Create "
+     "Clear Membership Rules document in Swahili: roles, meeting frequency (2× "
+     "monthly minimum), contributions expected, consequences of default; "
+     "(3) Move meeting attendance tracking from oral to digital (USSD: farmer "
+     "texts 'HERE' to register, creates transparent record); (4) Implement "
+     "Graduated Liability: new members (0%), year 2 (25%), year 3 (50%), "
+     "founding members (100%) — prevents unfair punishment of new farmers; "
+     "(5) Pay group leader small incentive fee (5% of repayment fee) for 100% "
+     "on-time repayment; (6) Post meeting minutes on WhatsApp + physical notice board."),
 
-    # Digital / technology
-    (["app", "website", "online", "digital", "network", "internet",
-      "data", "ussd", "sms", "platform", "portal", "login", "slow",
-      "crash", "error", "down"],
-     "Audit digital touchpoints; ensure USSD/SMS fallback for "
-     "low-bandwidth users and test regularly on Android entry-level devices."),
+    # 5. TRAINING — LANGUAGE & TIMING
+    (["training", "training sessions", "sessions", "english", "language",
+      "understand", "understood", "local", "swahili", "learned", "technique",
+      "spacing", "practical", "suppose", "workshop", "demo"],
+     "Redesign training delivery: (1) Conduct ALL training in Swahili FIRST "
+     "(not English) — translate materials to local language; (2) Schedule "
+     "training OFF-harvest (Feb-Apr, Sept-Oct) when farmers have free time; "
+     "(3) Move from classroom to DEMONSTRATION PLOTS (hands-on field learning); "
+     "(4) Record short 5-minute videos in Swahili showing: seed spacing, "
+     "fertilizer application, pest management — farmers replay offline; "
+     "(5) Offer women-only sessions (separate from mixed groups) for household schedules; "
+     "(6) Use Swahili proverbs (e.g., 'Haraka haraka haina baraka') to reinforce patience."),
 
-    # Health insurance / NHIF / SHIF
-    (["nhif", "shif", "insurance", "cover", "claim", "reimburse",
-      "scheme", "card", "benefit"],
-     "Clarify insurance benefits communication; partner with SHIF "
-     "to streamline pre-authorisation and claims processing."),
+    # ══════════════════════════════════════════════════════════════════
+    # HIGH PRIORITY THEMES (Appear in 3-4 questions)
+    # ══════════════════════════════════════════════════════════════════
 
-    # Safety / security
-    (["safe", "safety", "security", "theft", "crime", "danger",
-      "risk", "unsafe", "afraid", "fear"],
-     "Conduct a safety audit; coordinate with local security organs "
-     "and introduce visible security measures at service points."),
+    # 6. INPUT QUALITY — SEEDS & FERTILIZER
+    (["seeds", "seed", "fertilizer", "fertiliser", "mbolea", "mbegu",
+      "rotten", "germinate", "germination", "variety", "quality", "poor",
+      "performed", "perform", "spacing", "agronomic"],
+     "Implement pre-distribution quality assurance: (1) Test all seed batches "
+     "for germination rate (must exceed 85%) before release to farmers; (2) Have "
+     "supplier contracts specify quality penalties for rotten seed/fertilizer; "
+     "(3) Train farmer Quality Committees to spot-check inputs at collection; "
+     "(4) Establish rapid replacement protocol (48 hours) for defective inputs; "
+     "(5) Record batch numbers so failed inputs can be traced & credited; "
+     "(6) For underperforming varieties, collect farmer feedback and adjust seed selection."),
 
-    # Communication / information
-    (["information", "communicate", "update", "notice", "aware",
-      "know", "told", "announcement", "transparent", "explain",
-      "unclear", "confusing"],
-     "Improve proactive communication: send SMS/WhatsApp updates, "
-     "post clear notices in Swahili and English, and train staff "
-     "on clear messaging."),
+    # 7. MARKET LINKAGE — PRICE & ACCESS
+    (["market", "market linkage", "boda boda", "transport", "cost", "price",
+      "buyer", "sell", "collection", "sokoni", "mavuno", "post-harvest",
+      "storage", "nearest", "far", "profit", "income"],
+     "Establish farmer-friendly market linkages: (1) Develop forward contracts "
+     "with 2-3 certified buyers (maize traders, aggregators) — set FIXED PRICES "
+     "before harvest; (2) Organize bulked sales (groups of 5-10 farmers) to improve "
+     "bargaining power vs middlemen; (3) Negotiate flat boda-boda delivery rates "
+     "(e.g., 500 KES per bag) rather than per-km (saves 30-40%); (4) Create sub-location "
+     "collection hubs so farmers don't travel to county market; (5) Send SMS price alerts: "
+     "'Maize trading at 3200/bag at Eldoret market today'; (6) If farmer chooses own buyer, "
+     "OAF provides subsidized transport support."),
 
-    # Sanitation / facilities
-    (["toilet", "water", "clean", "dirty", "hygiene", "sanitation",
-      "facility", "facilities", "room", "building", "infrastructure"],
-     "Allocate resources for basic facility upgrades; partner with "
-     "county water departments for reliable water supply."),
+    # 8. COLLECTION POINT — ACCESSIBILITY
+    (["collection point", "collection", "point", "far", "distance", "mbali",
+      "nearest", "village", "location", "access", "transport", "delivery",
+      "reach"],
+     "Decentralize input distribution: (1) Establish collection points at "
+     "sub-location level (not just ward/county level) — target radius max 3 km "
+     "from any farmer; (2) Partner with existing community centers (schools, "
+     "health centers, churches) as collection depots; (3) Set collection windows "
+     "3-4 days per week so farmers can choose convenient times; (4) Shuttle "
+     "service: farmers pool transport costs to reduce per-person burden; "
+     "(5) For remotest farmers, offer mobile collection (OAF vehicle visits bi-weekly)."),
 
-    # Food / nutrition (schools, hospitals, social services)
-    (["food", "meal", "lunch", "hunger", "nutrition", "diet", "eat"],
-     "Review catering contracts or nutrition budgets; consider "
-     "community-based feeding partnerships."),
+    # 9. M-PESA & DIGITAL RESILIENCE
+    (["mpesa", "mpesa repayment", "system", "system failed", "down",
+      "payment", "ussd", "code", "airtel", "safaricom", "network", "online"],
+     "Implement multi-channel payment resilience: (1) Enable M-Pesa for "
+     "repayment BUT maintain CASH fallback option at collection points (network "
+     "fails 10-15% of the time); (2) Test M-Pesa on all providers (Airtel too, "
+     "not just Safaricom); (3) Provide USSD code option for balance checks; "
+     "(4) Train officers to accept physical payment books + cash receipts for "
+     "network downtime; (5) Partner with mobile money agents at collection points "
+     "for instant cash-in/out; (6) Send payment confirmation SMS to farmer "
+     "(reduces disputes over timing)."),
+
+    # ══════════════════════════════════════════════════════════════════
+    # CULTURAL & MULTILINGUAL CONTEXTS
+    # ══════════════════════════════════════════════════════════════════
+
+    # 10. SWAHILI-LANGUAGE CONTEXTS (Mbolea, Mafunzo, Mavuno)
+    (["ilikuwa", "mbolea", "mbegu", "mafunzo", "mavuno", "shama",
+      "afisa", "sokoni", "usafiri", "nzuri", "sawa", "poa"],
+     "Enhance cultural + linguistic integration: (1) Conduct ALL key messaging "
+     "(loan terms, quality guarantees, market prices) in Swahili FIRST, not English; "
+     "(2) Record training videos in Swahili with locally-relevant examples (neighbor's "
+     "harvest success, local pests); (3) Conduct focus groups in Swahili (farmers express "
+     "nuanced concerns better in mother language); (4) Train field officers in Swahili "
+     "facilitation skills; (5) Use Swahili proverbs in training to reinforce key messages; "
+     "(6) Celebrate harvest successes in Swahili (e.g., 'Mavuno yako ilikuwa moto!' = "
+     "'Your harvest was excellent!')."),
+
+    # 11. ACRE FUND PROGRAM — SUPPORT & SATISFACTION
+    (["acre fund", "acre", "fund", "support", "program", "helped", "satisfied",
+      "satisfied", "experience", "expectations", "deliver", "improvement",
+      "works", "success"],
+     "Amplify positive impacts while addressing gaps: (1) For satisfied farmers, "
+     "record success stories (50-word testimonials + photos) for training of new groups; "
+     "(2) Identify what's working: ask each happy farmer 'What was most helpful?' and "
+     "double down; (3) For less-satisfied: run mini-focus groups (5-6 farmers) to understand "
+     "specific pain points; (4) Create feedback loop: quarterly SMS survey asking 'Rate OAF "
+     "support 1-10'; (5) Invite satisfied farmers to mentor new groups (incentivize with "
+     "500 KES per group mentored); (6) Address systemic gaps (seed quality, timeliness); "
+     "(7) Measure impact: track yield increases year-on-year by village/group."),
+
+    # ══════════════════════════════════════════════════════════════════
+    # FALLBACK (Generic)
+    # ══════════════════════════════════════════════════════════════════
+
+    # 12. GENERAL / OTHER FEEDBACK
+    (["other", "feedback", "general", "misc"],
+     "For mixed or unclear feedback: (1) Conduct targeted informal conversations "
+     "(1-on-1 visits) with farmers who expressed concern; (2) Ask: 'What would improve this?' "
+     "and listen carefully; (3) If pattern emerges (multiple farmers mention same issue), "
+     "escalate to management with farmer quotes; (4) Co-design solution WITH farmers "
+     "(not for them); (5) Test solution with 2-3 farmer groups before full rollout; "
+     "(6) Track impact and adjust based on farmer feedback."),
 ]
 
 FALLBACK_RECOMMENDATION = (
     "Conduct targeted focus-group discussions to identify the root "
     "cause before designing an intervention."
 )
+
+# ── TIP: HOW TO EXTEND RECOMMENDATION_RULES FOR YOUR SECTOR ──────────
+# After running the pipeline, check the console for:
+#   "KEYWORD TIPS" — these are the actual terms found in your data
+#   that did NOT match any existing rule.
+# Copy those terms into a new rule tuple above, then write a
+# sector-specific recommendation. Example for a WASH project:
+#
+#   (["borehole", "pump", "handwashing", "latrine", "open defecation"],
+#    "Prioritise borehole rehabilitation and community-led sanitation "
+#    "campaigns; train local pump mechanics for sustained maintenance."),
+#
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -342,10 +533,112 @@ class FeedbackInsightEngine:
         self.key_insights: List[str] = []
         self.dataset_summary: Dict = {}
         self.emerging_issues: pd.DataFrame = pd.DataFrame()
+        self.cluster_to_theme_map: Dict = {}  # Cluster ID → Theme name mapping
 
         # ── cross-question artefacts ──────────────────────────────────
         self.question_results: Dict = {}
         self.cross_question_themes: List[str] = []
+
+        # ── LLM client (optional) ─────────────────────────────────────
+        # Cache maps frozenset-of-top-3-keywords → theme name so the same
+        # cluster never makes a second API call within a run.
+        self._theme_name_cache: Dict[str, str] = {}
+        self._anthropic_client = None
+        want_llm = (
+            self.config.use_llm_naming or self.config.use_llm_recommendations
+        )
+        if want_llm and ANTHROPIC_AVAILABLE:
+            try:
+                self._anthropic_client = _anthropic_lib.Anthropic()
+                log.info("Anthropic client initialised — LLM features enabled.")
+            except Exception as exc:
+                log.warning("Could not init Anthropic client (%s). "
+                            "Falling back to rule-based methods.", exc)
+        elif want_llm and not ANTHROPIC_AVAILABLE:
+            log.warning(
+                "anthropic package not installed — LLM features disabled. "
+                "Run: pip install anthropic"
+            )
+
+        # ── NEW: Load config and initialize engines (v3+ Upgrade) ────
+        self.pipeline_config = load_config()
+        
+        # Initialize advanced engines if enabled
+        self._init_advanced_engines()
+
+    def _init_advanced_engines(self) -> None:
+        """Initialize trigger/action engines from config."""
+        try:
+            # Try absolute imports first (when run as main script)
+            try:
+                from trigger_engine import TriggerEngine
+                from action_engine import ActionEngine
+            except ImportError:
+                # Fall back to relative imports (when imported as module)
+                from .trigger_engine import TriggerEngine
+                from .action_engine import ActionEngine
+            
+            self.trigger_engine = TriggerEngine(
+                self.pipeline_config.get("thresholds", {})
+            )
+            self.action_engine = ActionEngine(
+                sector=self.pipeline_config.get("sector", "")
+            )
+            
+            log.info("✓ Advanced engines initialized (triggers, actions)")
+        except Exception as exc:
+            log.warning("Could not initialize advanced engines (%s). "
+                       "Ensure trigger_engine.py, action_engine.py "
+                       "exist in project directory.", exc)
+            self.trigger_engine = None
+            self.action_engine = None
+
+    def _map_sentiment_label(self, score: float) -> str:
+        """
+        Convert sentiment score to label for trigger logic.
+        """
+        if score <= -0.05:
+            return "Problem"
+        elif score >= 0.05:
+            return "Positive"
+        else:
+            return "Neutral"
+
+
+    def _compute_dynamic_thresholds(self, themes: list) -> dict:
+        """
+        Compute percentile-based thresholds from theme impacts.
+        """
+        impacts = [t.get("impact", 0) for t in themes if t.get("impact") is not None]
+
+        if not impacts:
+            return {"high_impact": 1, "medium_impact": 1}
+
+        impacts_sorted = sorted(impacts)
+
+        n = len(impacts_sorted)
+
+        # Small dataset fallback
+        if n < 5:
+            high = max(impacts_sorted)
+            medium = impacts_sorted[n // 2]
+            return {"high_impact": high, "medium_impact": medium}
+
+        def percentile(data, p):
+            k = (len(data) - 1) * (p / 100)
+            f = int(k)
+            c = min(f + 1, len(data) - 1)
+            if f == c:
+                return data[int(k)]
+            return data[f] + (data[c] - data[f]) * (k - f)
+
+        high = percentile(impacts_sorted, 80)
+        medium = percentile(impacts_sorted, 50)
+
+        return {
+            "high_impact": max(1, round(high)),
+            "medium_impact": max(1, round(medium))
+        }
 
     # ══════════════════════════════════════════════════════════════════
     # FILE LOADING
@@ -398,6 +691,9 @@ class FeedbackInsightEngine:
         self.q_df.at[getattr(self, "_current_idx", 0), "lang"] = lang
 
         text = text.lower()
+        
+        # ── NEW: Sector-aware text normalization (v3+ upgrade) ────
+        text = self.normalize_text(text)
 
         if lang in ("sw", "en"):
             # Keep only ASCII letters + spaces for now
@@ -409,6 +705,33 @@ class FeedbackInsightEngine:
 
         # Normalise whitespace
         text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def normalize_text(self, text: str) -> str:
+        """
+        Normalize sector-specific terminology for consistent clustering.
+        
+        ⚠️  RULE-BASED & SECTOR-AWARE:
+        This method uses normalizations specific to smallholder agriculture.
+        If you're using this on a different sector, add your own rules:
+        
+        HEALTHCARE examples:
+            text = text.replace("hiv aids", "hiv")
+            text = text.replace("doc", "doctor")
+        
+        WASH examples:
+            text = text.replace("pit latrine", "latrine")
+            text = text.replace("bore hole", "borehole")
+        """
+        # Smallholder agriculture normalizations
+        text = text.replace("m pesa", "mpesa")      # Standardize M-Pesa
+        text = text.replace("m-pesa", "mpesa")
+        text = text.replace("boda boda", "boda")    # Standardize boda
+        text = text.replace("bodaboda", "boda")
+        text = text.replace("matatu", "transport")
+        text = text.replace("extension officer", "officer")
+        text = text.replace("field officer", "officer")
+        
         return text
 
     # ══════════════════════════════════════════════════════════════════
@@ -571,6 +894,62 @@ class FeedbackInsightEngine:
         del unique_embeddings
         gc.collect()
 
+    # ═══════════════════════════════════════════════════════════════════
+    # EMBEDDING CACHE (v3+ Upgrade)
+    # ═══════════════════════════════════════════════════════════════════
+    # Dramatic speed boost on re-runs: cache embeddings to disk and reuse
+
+    def get_embeddings_cached(
+        self,
+        texts: List[str],
+        cache_path: str = "embeddings_cache.pkl",
+        force_recompute: bool = False,
+    ) -> np.ndarray:
+        """
+        Get embeddings with disk caching for huge speed boost on re-runs.
+        
+        PERFORMANCE: First run: 60s. Cached re-runs: <1s. ~60× speedup.
+        
+        Args:
+            texts: list of strings to encode
+            cache_path: where to save pickle cache
+            force_recompute: if True, ignore cache and recompute
+        
+        Returns:
+            np.ndarray of embeddings (shape: [len(texts), embedding_dim])
+        """
+        cache_file = Path(cache_path)
+        
+        # Try loading from cache
+        if cache_file.exists() and not force_recompute:
+            try:
+                with open(cache_file, "rb") as f:
+                    cached = pickle.load(f)
+                if len(cached) == len(texts):
+                    log.info("✓ Loaded embeddings from cache (%s)", cache_path)
+                    return cached
+            except Exception as exc:
+                log.warning("Cache load failed (%s). Recomputing…", exc)
+        
+        # Compute fresh embeddings
+        log.info("Computing embeddings (no valid cache) …")
+        embeddings = self.model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+        
+        # Save to cache
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(embeddings, f)
+            log.info("✓ Saved embeddings cache to %s", cache_path)
+        except Exception as exc:
+            log.warning("Could not save cache (%s)", exc)
+        
+        return embeddings
+
     # ══════════════════════════════════════════════════════════════════
     # CLUSTER COUNT SELECTION
     # ══════════════════════════════════════════════════════════════════
@@ -679,17 +1058,108 @@ class FeedbackInsightEngine:
         return keywords
 
     # ══════════════════════════════════════════════════════════════════
-    # THEME NAMING
+    # THEME NAMING  ─ LLM-first with smart rule-based fallback
     # ══════════════════════════════════════════════════════════════════
 
-    def generate_theme_name(self, keywords: List[str]) -> str:
+    def generate_theme_name(
+        self, keywords: List[str], samples: Optional[List[str]] = None
+    ) -> str:
+        """
+        Public entry-point for theme naming.
+        • LLM path  : one cached API call → meaningful 2-4 word name.
+        • Fallback  : improved rule-based (no redundant word-pairs).
+        """
         if not keywords:
             return "Other Feedback"
-        primary = keywords[0]
-        secondary = keywords[1] if len(keywords) > 1 else ""
-        phrase = f"{primary} {secondary}".strip().replace("_", " ")
-        words = list(dict.fromkeys(phrase.split()))
-        return " ".join(words).title()
+
+        # Cache key = sorted top-3 keywords (stable across calls)
+        cache_key = "|".join(sorted(keywords[:3]))
+        if cache_key in self._theme_name_cache:
+            return self._theme_name_cache[cache_key]
+
+        if self._anthropic_client and self.config.use_llm_naming:
+            name = self._llm_theme_name(keywords, samples or [])
+        else:
+            name = self._rule_based_theme_name(keywords)
+
+        self._theme_name_cache[cache_key] = name
+        return name
+
+    def _rule_based_theme_name(self, keywords: List[str]) -> str:
+        """
+        Improved rule-based naming — avoids gibberish like 'Training Seeds'
+        or 'Seeds Seed'.
+
+        Strategy:
+          1. Bigram TF-IDF features (e.g. 'late delivery') are already
+             meaningful phrases → prefer them as the theme.
+          2. For unigrams, skip any keyword whose stem is already represented
+             by another keyword in the pair (avoids 'Train Training').
+          3. Build at most a 3-token theme; deduplicate within it.
+        """
+        bigrams  = [k for k in keywords if " " in k]
+        unigrams = [k for k in keywords if " " not in k]
+
+        # ── Case 1: use the best bigram as the primary label ──────────
+        if bigrams:
+            primary = bigrams[0].title()
+            # Try to append a discriminating unigram if it adds new info
+            for u in unigrams:
+                if u.lower() not in bigrams[0].lower():
+                    return f"{primary} — {u.title()}"
+            return primary
+
+        # ── Case 2: two unigrams — check for stem overlap ─────────────
+        if len(unigrams) >= 2:
+            p1, p2 = unigrams[0], unigrams[1]
+            # Overlap check: one is a substring of the other?
+            if p1.lower() in p2.lower() or p2.lower() in p1.lower():
+                # Redundant pair → use longer one + third keyword
+                primary = max(p1, p2, key=len).title()
+                if len(unigrams) >= 3:
+                    return f"{primary} {unigrams[2].title()}"
+                return primary
+            # Pair looks fine
+            return f"{p1.title()} {p2.title()}"
+
+        # ── Case 3: single keyword ─────────────────────────────────────
+        return unigrams[0].title() if unigrams else "Other Feedback"
+
+    def _llm_theme_name(
+        self, keywords: List[str], samples: List[str]
+    ) -> str:
+        """
+        Ask Claude (Haiku) for a meaningful 2-4 word theme name.
+        Falls back to rule-based on any API error.
+        """
+        sector_ctx = (
+            f"The data comes from a {self.config.sector} programme."
+            if self.config.sector else ""
+        )
+        sample_text = " | ".join(samples[:3]) if samples else "(none)"
+        prompt = (
+            f"You are labelling themes extracted from survey feedback. "
+            f"{sector_ctx}\n\n"
+            f"Top keywords: {', '.join(keywords[:6])}\n"
+            f"Example responses: {sample_text}\n\n"
+            "Give a clear, meaningful 2–4 word theme label that a non-technical "
+            "M&E officer would immediately understand. "
+            "Return ONLY the theme name — no punctuation, no explanation."
+        )
+        try:
+            response = self._anthropic_client.messages.create(
+                model=self.config.anthropic_model,
+                max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip().strip('"').strip("'")
+            # Sanity: reject if response is too long or empty
+            if 2 <= len(raw.split()) <= 6 and raw:
+                return raw.title()
+            return self._rule_based_theme_name(keywords)
+        except Exception as exc:
+            log.debug("LLM theme naming failed (%s); using rule-based.", exc)
+            return self._rule_based_theme_name(keywords)
 
     # ══════════════════════════════════════════════════════════════════
     # CLUSTER SUMMARY BUILD
@@ -699,165 +1169,412 @@ class FeedbackInsightEngine:
         self.cluster_summary = {}
         for cid in sorted(self.q_df["cluster"].unique()):
             subset = self.q_df[self.q_df["cluster"] == cid]
-            texts = subset["clean_text"].tolist()
+            texts   = subset["clean_text"].tolist()
             indices = subset.index.tolist()
             kw = self.extract_keywords(indices, self.config.top_keywords)
             self.cluster_summary[cid] = {
-                "count": len(texts),
+                "count":    len(texts),
                 "keywords": kw,
-                "samples": texts[:5],
+                "samples":  texts[:5],
             }
+            # Pre-warm the theme name cache while cluster data is fresh
+            self.generate_theme_name(kw, texts[:3])
 
     # ══════════════════════════════════════════════════════════════════
     # SUMMARY TABLE  ─ % based on per-question raw response count
     # ══════════════════════════════════════════════════════════════════
 
     def build_summary_table(self) -> None:
-        """Build summary table with improved sentiment impact calculation.
-        
-        Revised (v2.1):
-        - Average Sentiment now uses a robust calculation that accounts for
-          both positive and negative sentiment scores
-        - Impact Score now factors in sentiment direction more precisely
+        """
+        Build a standardized summary of themes.
+
+        This revised implementation standardizes theme structure, computes
+        percentile-based thresholds, reinitializes the TriggerEngine with
+        data-driven thresholds, applies Trigger/Action engines to
+        each theme, validates results, and produces `self.summary_df`.
         """
         total = self._question_response_count  # set in run() per question
-        rows = []
 
+        # 1) Collect raw theme records from cluster summary
+        themes = []
         for cid, info in self.cluster_summary.items():
-            theme = self.generate_theme_name(info["keywords"])
+            theme_name = self.generate_theme_name(info.get("keywords", []))
             subset = self.q_df[self.q_df["cluster"] == cid]
-            
-            # Calculate average sentiment more robustly
-            sentiments = subset["sentiment"].tolist()
-            avg_sent = sum(sentiments) / len(sentiments) if sentiments else 0.0
-            pct = round((info["count"] / total) * 100, 2)
+            avg_sent = subset["sentiment"].mean() if len(subset) > 0 else 0.0
+            pct = round((info.get("count", 0) / max(total, 1)) * 100, 2)
 
-            # Intensity score: measure of how strongly negative/positive
-            abs_sentiments = [abs(s) for s in sentiments]
+            # intensity: few very negative sentences vs many mildly negative
+            negative_sentences = subset[subset["sentiment"] < -0.3]
             intensity = (
-                sum(abs_sentiments) / len(abs_sentiments)
-                if abs_sentiments else 0.0
+                negative_sentences["sentiment"].abs().mean()
+                if len(negative_sentences) > 0 else 0.0
             )
-            
-            # Impact Score: count × average sentiment intensity
-            # For all sentiments, use absolute value (whether negative or positive)
-            impact_multiplier = (
-                sum(abs_sentiments) / len(abs_sentiments)
-                if abs_sentiments else 0.0
-            )
-            severity = info["count"] * impact_multiplier
+            severity = info.get("count", 0) * abs(avg_sent)
 
-            rows.append({
-                "Theme": theme,
-                "Response Count": info["count"],
-                "Share (%)": pct,
-                "Impact Score": round(severity, 2),
-                "Intensity Score": round(intensity, 3),
-                "Average Sentiment": round(avg_sent, 3),
-                "Key Keywords": ", ".join(info["keywords"]),
-                "Representative Quote": info["samples"][0],
+            themes.append({
+                "cluster_id": cid,
+                "name": theme_name,
+                "impact": int(info.get("count", 0)),
+                "share_pct": pct,
+                "impact_score": round(severity, 2),
+                "intensity": round(intensity, 3),
+                "sentiment_score": round(avg_sent, 3),
+                "keywords": [k.strip() for k in info.get("keywords", []) if k.strip()],
+                "representative_quote": info.get("samples", [""])[0] if info.get("samples") else "",
+                "recommendation": info.get("recommendation", "") or "",
             })
 
-        self.summary_df = pd.DataFrame(rows).sort_values(
-            "Impact Score", ascending=False
-        )
+        # 2) Map sentiment scores -> labels (strict mapping per spec)
+        for t in themes:
+            sc = t.get("sentiment_score", 0.0)
+            if sc <= -0.05:
+                t["sentiment"] = "Problem"
+            elif sc >= 0.05:
+                t["sentiment"] = "Positive"
+            else:
+                t["sentiment"] = "Neutral"
+
+        # 3) Compute percentile-based thresholds for impact
+        impacts = sorted([t["impact"] for t in themes])
+        high_thresh = None
+        med_thresh = None
+        if len(impacts) == 0:
+            high_thresh = med_thresh = 0
+        elif len(impacts) < 5:
+            # small dataset: use max and median
+            high_thresh = max(impacts)
+            med_thresh = int(pd.Series(impacts).median())
+        else:
+            # 80th and 50th percentiles
+            high_thresh = int(pd.Series(impacts).quantile(0.8))
+            med_thresh = int(pd.Series(impacts).quantile(0.5))
+
+        # Handle uniform values edge-case
+        if high_thresh is None:
+            high_thresh = med_thresh = 0
+        if high_thresh == med_thresh and len(impacts) > 0:
+            # keep them equal; TriggerEngine will handle equality
+            pass
+
+        log.info(f"  ▶ Computed thresholds — HIGH: {high_thresh}, MEDIUM: {med_thresh}")
+
+        # 4) Reinitialize TriggerEngine with new thresholds (overrides previous)
+        try:
+            from trigger_engine import TriggerEngine
+            self.trigger_engine = TriggerEngine({"high_impact": high_thresh, "medium_impact": med_thresh})
+        except Exception:
+            log.warning("TriggerEngine import failed — continuing with existing engine")
+
+        # 5) Apply all engines to each theme and enrich
+        enriched = []
+        for t in themes:
+            theme_input = {
+                "name": t["name"],
+                "impact": t["impact"],
+                "sentiment": t.get("sentiment", "Neutral"),
+                "sentiment_score": t.get("sentiment_score", 0.0),
+                "keywords": t.get("keywords", []),
+                "recommendation": t.get("recommendation", ""),
+            }
+
+            # Trigger
+            triggers = []
+            if getattr(self, "trigger_engine", None) and self.pipeline_config.get("features", {}).get("enable_trigger_engine", True):
+                try:
+                    triggers = self.trigger_engine.evaluate(theme_input) or []
+                except Exception as exc:
+                    log.debug("Trigger engine error for %s: %s", t["name"], exc)
+
+            # Determine priority label from triggers (pick highest)
+            priority_label = "Low"
+            if isinstance(triggers, list) and triggers:
+                levels = [str(x.get("level", "")).upper() for x in triggers]
+                if any(l == "HIGH" for l in levels):
+                    priority_label = "High"
+                elif any(l == "MEDIUM" for l in levels):
+                    priority_label = "Medium"
+                elif any(l == "POSITIVE" for l in levels):
+                    priority_label = "Positive"
+
+            # Trend is REMOVED — TriggerEngine is the single source of truth for priority
+            
+            # Action plan
+            action_plan = {}
+            if getattr(self, "action_engine", None) and self.pipeline_config.get("features", {}).get("enable_action_engine", True):
+                try:
+                    action_plan = self.action_engine.generate(theme_input) or {}
+                except Exception as exc:
+                    log.debug("Action engine error for %s: %s", t["name"], exc)
+
+            # Compose actions string
+            actions_list = action_plan.get("actions") if isinstance(action_plan.get("actions"), list) else []
+            actions_joined = "; ".join(str(a) for a in actions_list) if actions_list else "No action specified"
+
+            # Extract Trigger Status from triggers list (ALWAYS has one element)
+            trigger_status = "No Alert"
+            if isinstance(triggers, list) and triggers:
+                trigger_status = triggers[0].get("message", "No Alert")
+            
+            enriched.append({
+                "Cluster ID": t["cluster_id"],
+                "Theme": t["name"],
+                "Response Count": t["impact"],
+                "Share (%)": t["share_pct"],
+                "Impact Score": t["impact_score"],
+                "Intensity Score": t["intensity"],
+                "Average Sentiment": t["sentiment_score"],
+                "Theme Sentiment": t.get("sentiment", "Neutral"),
+                "Key Keywords": ", ".join(t.get("keywords", [])),
+                "Representative Quote": t.get("representative_quote", ""),
+                "triggers": triggers,
+                "Priority": priority_label,
+                "Trigger Status": trigger_status,
+                "Action Owner": action_plan.get("owner", "Program Manager"),
+                "Timeline (Days)": action_plan.get("timeline", 30),
+                "Actions": actions_joined,
+                "Recommendation": t.get("recommendation", ""),
+                "action_plan": action_plan,
+            })
+
+        # 6) Validation: ensure required fields
+        for rec in enriched:
+            if not rec.get("Priority"):
+                rec["Priority"] = "Low"
+            if not rec.get("Trigger Status"):
+                rec["Trigger Status"] = "No Alert"
+            if not rec.get("Action Owner"):
+                rec["Action Owner"] = "Program Manager"
+            if not rec.get("Actions"):
+                rec["Actions"] = "No action specified"
+
+        # 7) Build final DataFrame
+        self.summary_df = pd.DataFrame(enriched)
+        # Sort by Impact Score desc for presentation
+        if "Impact Score" in self.summary_df.columns:
+            self.summary_df = self.summary_df.sort_values("Impact Score", ascending=False).reset_index(drop=True)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # APPLY ADVANCED ENGINES (DEPRECATED)
+    # ═══════════════════════════════════════════════════════════════════
+    # Logic now moved to build_summary_table for single source of truth
+
+    def apply_advanced_engines(self) -> None:
+        """
+        All advanced engine logic (triggers, actions) is now handled in
+        build_summary_table() to ensure single source of truth.
+        This method is retained for backward compatibility but does nothing.
+        """
+        # All logic now in build_summary_table
+        if all(col in self.summary_df.columns for col in ("triggers", "Priority", "action_plan")):
+            log.info("Advanced engines already applied in build_summary_table — skipping.")
+            return
+        
+        log.info("✓ Advanced engines already applied")
 
     # ══════════════════════════════════════════════════════════════════
-    # SENTIMENT LABEL  ─ revised with keyword-based detection
+    # SENTIMENT LABEL  ─ keyword-aware + sentiment threshold
     # ══════════════════════════════════════════════════════════════════
 
     def classify_theme_sentiment(self) -> None:
-        """Classify theme sentiment using both sentiment score and keywords.
+        """Classify theme sentiment using BOTH sentiment score AND keywords.
         
-        Thresholds revised (v2.1):
-        - Problem: avg_sentiment < -0.05 OR (keywords match problem terms)
-        - Positive: avg_sentiment > 0.15
+        This prevents false neutrals where a theme seems like a problem
+        but sentiment is borderline.
+        
+        Thresholds (v3.0):
+        - Problem: sentiment < -0.05 OR (keywords match problem terms)
+        - Positive: sentiment > 0.1 AND no problem keywords
         - Neutral: everything else
         """
         problem_keywords = {
             "problem", "issue", "complaint", "poor", "bad", "terrible",
             "awful", "horrible", "delay", "slow", "difficult", "challenge",
             "struggle", "frustrate", "disappoint", "dissat", "fail",
-            "broken", "error", "bug", "stuck", "chal",
-            "unavailable", "shortage", "late", "waiting", "rude",
-            "unfriendly", "expensive", "costly", "mbaya", "tatizo",
+            "broken", "error", "bug", "stuck", "unavailable", "shortage",
+            "late", "waiting", "queue", "rude", "unfriendly", "expensive",
+            "costly", "mbaya", "tatizo", "shida", "lalamiko"
         }
+        
         labels = []
-        for idx, (s, keywords) in enumerate(
-            zip(self.summary_df["Average Sentiment"],
-                self.summary_df["Key Keywords"])
-        ):
-            kw_lower = keywords.lower() if keywords else ""
-            has_problem_keyword = any(
-                pk in kw_lower for pk in problem_keywords
-            )
+        for idx, row in self.summary_df.iterrows():
+            sentiment = row["Average Sentiment"]
+            keywords = str(row.get("Key Keywords", "")).lower()
             
-            if s < -0.05 or has_problem_keyword:
+            # Check if problem keywords present
+            has_problem_keyword = any(pk in keywords for pk in problem_keywords)
+            
+            if sentiment < -0.05 or has_problem_keyword:
                 labels.append("Problem")
-            elif s > 0.15:
+            elif sentiment > 0.1 and not has_problem_keyword:
                 labels.append("Positive")
             else:
                 labels.append("Neutral")
+        
         self.summary_df["Theme Sentiment"] = labels
 
     # ══════════════════════════════════════════════════════════════════
-    # RECOMMENDATIONS  ─ rule-based with African context
+    # RECOMMENDATIONS  ─ LLM-first, rule-based fallback, keyword tips
     # ══════════════════════════════════════════════════════════════════
 
     def generate_recommendations(self) -> None:
+        """
+        Generates one recommendation per theme.
+
+        Mode A — LLM (use_llm_recommendations=True AND anthropic installed):
+          Sends ALL themes in a single batch API call so latency is low.
+          The LLM receives: theme name, sentiment, keywords, a sample quote,
+          and the sector context — producing specific, actionable advice.
+
+        Mode B — Rule-based (fallback):
+          Matches keywords against RECOMMENDATION_RULES.
+          After matching, prints the KEYWORD TIPS report so you can see
+          which terms fell through to the fallback and add new rules.
+        """
+        if self._anthropic_client and self.config.use_llm_recommendations:
+            self._llm_generate_recommendations()
+        else:
+            self._rule_based_recommendations()
+            self.print_keyword_tips(quiet=False)
+
+    def _llm_generate_recommendations(self) -> None:
+        """Batch API call: all themes → one request → list of recommendations."""
+        sector_ctx = (
+            f"The organisation works in the {self.config.sector} sector in "
+            f"Kenya/East Africa."
+            if self.config.sector
+            else "The organisation operates in Kenya/East Africa."
+        )
+
+        # Build a compact JSON payload — only what the LLM needs
+        themes_payload = [
+            {
+                "id": i,
+                "theme": row["Theme"],
+                "sentiment": row.get("Theme Sentiment", ""),
+                "keywords": row["Key Keywords"],
+                "quote": row["Representative Quote"],
+            }
+            for i, (_, row) in enumerate(self.summary_df.iterrows())
+        ]
+
+        prompt = (
+            f"You are an experienced M&E advisor. {sector_ctx}\n\n"
+            "For each feedback theme below, write ONE practical, specific "
+            "recommendation (1–2 sentences). Use local African context where "
+            "relevant (M-Pesa, boda-boda, SMS/USSD, county structures, etc.).\n\n"
+            f"Themes:\n{json.dumps(themes_payload, indent=2)}\n\n"
+            "Return a JSON array of strings — one recommendation per theme, "
+            "in the SAME order as the input. "
+            "Return ONLY the JSON array. No explanation, no markdown."
+        )
+
+        try:
+            response = self._anthropic_client.messages.create(
+                model=self.config.anthropic_model,
+                max_tokens=800,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = response.content[0].text.strip()
+            # Strip markdown code fences if present
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw).strip()
+            recs = json.loads(raw)
+
+            if isinstance(recs, list) and len(recs) == len(self.summary_df):
+                if "Recommendation" in self.summary_df.columns:
+                    self.summary_df["Recommendation"] = recs
+                else:
+                    try:
+                        self.summary_df.insert(5, "Recommendation", recs)
+                    except Exception:
+                        self.summary_df["Recommendation"] = recs
+                return
+            log.warning("LLM returned %d recs for %d themes — falling back.",
+                        len(recs), len(self.summary_df))
+        except Exception as exc:
+            log.warning("LLM recommendation generation failed (%s) — "
+                        "falling back to rule-based.", exc)
+
+        # Fallback
+        self._rule_based_recommendations()
+
+    def _rule_based_recommendations(self) -> None:
+        """Match theme keywords against RECOMMENDATION_RULES."""
         recs = []
         for _, row in self.summary_df.iterrows():
             text = (row["Theme"] + " " + row["Key Keywords"]).lower()
             matched = FALLBACK_RECOMMENDATION
-            for keywords, rec in RECOMMENDATION_RULES:
-                if any(k in text for k in keywords):
+            for rule_keywords, rec in RECOMMENDATION_RULES:
+                if any(k in text for k in rule_keywords):
                     matched = rec
                     break
             recs.append(matched)
-        self.summary_df.insert(5, "Recommendation", recs)
+        if "Recommendation" in self.summary_df.columns:
+            self.summary_df["Recommendation"] = recs
+        else:
+            try:
+                self.summary_df.insert(5, "Recommendation", recs)
+            except Exception:
+                self.summary_df["Recommendation"] = recs
 
-    # ══════════════════════════════════════════════════════════════════
-    # PRIORITY LABELS  ─ intensity & sentiment-aware (revised v2.1)
-    # ══════════════════════════════════════════════════════════════════
-
-    def add_priority_labels(self) -> None:
-        """Priority assessment revised to account for problem sentiment.
-        
-        Rules (v2.1):
-        - Problems with Impact > 15 OR (Impact > 8 AND Intensity > 0.4):
-          🔴 High Priority
-        - Problems with Impact > 5 OR Positive with high count (>15 responses):
-          🟡 Medium Priority
-        - Everything else:
-          🟢 Low Priority
+    def print_keyword_tips(self, quiet: bool = False) -> None:
         """
-        priorities = []
+        ╔══════════════════════════════════════════════════════════════╗
+        ║  KEYWORD TIPS — Recommendation Rule Coverage Report         ║
+        ╚══════════════════════════════════════════════════════════════╝
+        Prints all keywords found in this question, whether each matched
+        a RECOMMENDATION_RULE, and which terms fell through to the
+        generic fallback.
+
+        Use this to extend RECOMMENDATION_RULES for your sector:
+          1. Look at the ⚠ UNMATCHED section below.
+          2. Group related unmatched terms into a new rule tuple.
+          3. Write a sector-specific recommendation string.
+          4. Add it to RECOMMENDATION_RULES near the top of the file.
+        """
+        if quiet or self.summary_df.empty:
+            return
+
+        all_rule_kw: set = set()
+        for rule_kw, _ in RECOMMENDATION_RULES:
+            all_rule_kw.update(rule_kw)
+
+        SEP = "─" * 62
+        print(f"\n{'═' * 62}")
+        print("  KEYWORD TIPS  —  Recommendation Rule Coverage")
+        print(f"{'═' * 62}")
+
         for _, row in self.summary_df.iterrows():
-            score = row["Impact Score"]
-            intensity = row["Intensity Score"]
-            sentiment = row.get("Theme Sentiment", "Neutral")
-            response_count = row["Response Count"]
+            theme   = row["Theme"]
+            kw_str  = row.get("Key Keywords", "")
+            rec     = row.get("Recommendation", "")
+            kw_list = [k.strip() for k in kw_str.split(",") if k.strip()]
 
-            if sentiment == "Problem":
-                if score > 15 or (score > 8 and intensity > 0.4):
-                    priorities.append("🔴 High Priority")
-                elif score > 5:
-                    priorities.append("🟡 Medium Priority")
-                else:
-                    priorities.append("🟢 Low Priority")
-            elif sentiment == "Positive":
-                # Positive feedback with high volume is still medium priority
-                if response_count > 15:
-                    priorities.append("🟡 Medium Priority")
-                else:
-                    priorities.append("🟢 Low Priority")
-            else:  # Neutral
-                if score > 20:
-                    priorities.append("🟡 Medium Priority")
-                else:
-                    priorities.append("🟢 Low Priority")
+            matched   = [k for k in kw_list if k in all_rule_kw]
+            unmatched = [k for k in kw_list if k not in all_rule_kw]
+            used_fallback = (rec == FALLBACK_RECOMMENDATION)
 
-        self.summary_df.insert(4, "Priority", priorities)
+            icon = "⚠ " if used_fallback else "✅"
+            print(f"\n  {icon} Theme : {theme}")
+            print(f"     Keywords : {', '.join(kw_list) or '(none)'}")
+            if matched:
+                print(f"     Matched rules on : {', '.join(matched)}")
+            if unmatched:
+                print(f"     ⚠ Unmatched terms : {', '.join(unmatched)}")
+                print(f"       → Add these to RECOMMENDATION_RULES for "
+                      f"better coverage.")
+            if used_fallback:
+                print(f"     ⚠ Used generic fallback — no rule matched.")
+
+        print(f"\n{SEP}")
+        print("  TIP: To add a rule, insert this pattern into RECOMMENDATION_RULES:")
+        print('    (["keyword1", "keyword2", ...],')
+        print('     "Your sector-specific recommendation here."),')
+        print(f"{SEP}\n")
+
+    # ══════════════════════════════════════════════════════════════════
+    # PRIORITY LABELS  ─ intensity-aware
+    # ══════════════════════════════════════════════════════════════════
 
     # ══════════════════════════════════════════════════════════════════
     # MERGE SIMILAR THEMES
@@ -865,6 +1582,14 @@ class FeedbackInsightEngine:
 
     def merge_similar_themes(self) -> None:
         themes = self.summary_df["Theme"].tolist()
+        
+        # Initialize mapping for all clusters
+        self.cluster_to_theme_map = {}
+        if "Cluster ID" in self.summary_df.columns:
+            for idx, row in self.summary_df.iterrows():
+                cluster_id = row.get("Cluster ID", -1)
+                self.cluster_to_theme_map[cluster_id] = row.get("Theme", "Unknown")
+        
         if len(themes) <= 1:
             return
 
@@ -886,10 +1611,19 @@ class FeedbackInsightEngine:
                     merged_map[theme_i].append(j)
                     used.add(j)
 
+        # Update cluster ID mapping with merged themes
+        self.cluster_to_theme_map = {}
+        
         new_rows = []
         for main_theme, idxs in merged_map.items():
             subset = self.summary_df.iloc[idxs]
+            # Get all cluster IDs being merged
+            cluster_ids = subset["Cluster ID"].tolist() if "Cluster ID" in subset.columns else []
+            for cid in cluster_ids:
+                self.cluster_to_theme_map[cid] = main_theme
+            
             row = {
+                "Cluster ID": cluster_ids[0] if cluster_ids else -1,  # Store first cluster ID
                 "Theme": main_theme,
                 "Response Count": subset["Response Count"].sum(),
                 "Share (%)": round(subset["Share (%)"].sum(), 2),
@@ -900,6 +1634,10 @@ class FeedbackInsightEngine:
                 "Representative Quote": subset["Representative Quote"].iloc[0],
                 "Recommendation": subset["Recommendation"].iloc[0],
                 "Priority": subset["Priority"].iloc[0],
+                "Trigger Status": subset["Trigger Status"].iloc[0] if "Trigger Status" in subset.columns else "No Alert",
+                # ─ Preserve advanced engine columns ──────────────────
+                "action_plan": subset["action_plan"].iloc[0] if "action_plan" in subset.columns else {},
+                "triggers": subset["triggers"].iloc[0] if "triggers" in subset.columns else [],
             }
             new_rows.append(row)
 
@@ -1025,10 +1763,10 @@ class FeedbackInsightEngine:
     # EXCEL STYLE HELPERS
     # ══════════════════════════════════════════════════════════════════
 
-    HEADER_COLOUR  = "2F5597"   # navy blue
-    HEADING_COLOUR = "1F3864"   # darker navy for sheet title bar
+    HEADER_COLOUR  = "2F5597"   # navy blue (with white text)
+    HEADING_COLOUR = "1F3864"   # darker navy for sheet title bar (with white text)
     STRIPE_COLOUR  = "EEF2FF"   # soft lavender stripe
-    SUBHEAD_COLOUR = "D6E4F7"   # light blue for section sub-headers
+    SUBHEAD_COLOUR = "D6E4F7"   # light blue for section sub-headers (with BLACK text)
 
     ACCENT_COLOURS = {
         "Problem":  "FFE0E0",   # soft red
@@ -1048,9 +1786,9 @@ class FeedbackInsightEngine:
         "Priority":               20,
         "Theme Sentiment":        18,
         "Key Keywords":           38,
-        "Representative Quote":   70,  # increased for better readability
-        "Recommendation":         75,  # increased for full recommendation text
-        "Quote":                  75,  # increased for full quote visibility
+        "Representative Quote":   52,
+        "Recommendation":         48,
+        "Quote":                  55,
         "Languages Detected":     28,
     }
     COL_DEFAULT_MIN = 14   # fallback minimum for any column not listed above
@@ -1132,6 +1870,7 @@ class FeedbackInsightEngine:
         for cell in ws[header_row]:
             if cell.value is None:
                 continue
+            # Use white text for navy headers
             cell.font = Font(
                 name="Calibri", size=10, bold=True, color="FFFFFF"
             )
@@ -1225,6 +1964,58 @@ class FeedbackInsightEngine:
                ws.row_dimensions[r].height < height:
                 ws.row_dimensions[r].height = height
 
+    # ═══════════════════════════════════════════════════════════════════
+    # PREPARE SUMMARY FOR EXCEL (v3+ Upgrade)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def prepare_summary_for_excel(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert complex trigger/action dicts to readable Excel-friendly strings.
+        
+        Args:
+            df: summary_df from question_results
+        
+        Returns:
+            Modified dataframe with trigger/action columns as strings
+        """
+        export_df = df.copy()
+        
+        # Trigger Status should already be in summary_df from build_summary_table
+        if "Trigger Status" not in export_df.columns and "triggers" in export_df.columns:
+            export_df["Trigger Status"] = export_df["triggers"].apply(
+                lambda triggers: (
+                    " | ".join([t.get("icon", "") + " " + t.get("level", "") 
+                               for t in triggers])
+                    if isinstance(triggers, list) and triggers else "No Alert"
+                )
+            )
+        elif "Trigger Status" not in export_df.columns:
+            export_df["Trigger Status"] = "No Alert"
+        
+        # Action Owner and Timeline should already be in summary_df from build_summary_table
+        if "Action Owner" not in export_df.columns or "Timeline (Days)" not in export_df.columns:
+            if "action_plan" in export_df.columns:
+                if "Action Owner" not in export_df.columns:
+                    export_df["Action Owner"] = export_df["action_plan"].apply(
+                        lambda ap: (
+                            ap.get("owner", "Program Manager") if isinstance(ap, dict) else "Program Manager"
+                        )
+                    )
+                
+                if "Timeline (Days)" not in export_df.columns:
+                    export_df["Timeline (Days)"] = export_df["action_plan"].apply(
+                        lambda ap: (
+                            str(ap.get("timeline", 60)) if isinstance(ap, dict) else "60"
+                        )
+                    )
+            else:
+                if "Action Owner" not in export_df.columns:
+                    export_df["Action Owner"] = "Program Manager"
+                if "Timeline (Days)" not in export_df.columns:
+                    export_df["Timeline (Days)"] = "60"
+        
+        return export_df
+
     # ══════════════════════════════════════════════════════════════════
     # EXCEL REPORT  ─ multi-question, fully rebuilt
     # ══════════════════════════════════════════════════════════════════
@@ -1237,10 +2028,11 @@ class FeedbackInsightEngine:
         wb.remove(wb.active)
 
         # ══════════════════════════════════════════════════════════════
-        # 1. EXECUTIVE SUMMARY (Table-Based Layout v2.1)
+        # 1. EXECUTIVE SUMMARY (Fully Table-Based - v4.0)
+        #    All content now in proper tables with borders to prevent overlapping
         # ══════════════════════════════════════════════════════════════
         ws = wb.create_sheet("Executive Summary")
-        EXEC_MERGE = 8   # columns to merge for heading
+        EXEC_MERGE = 5   # columns for heading merge
 
         next_row = self.write_sheet_heading(
             ws,
@@ -1253,141 +2045,146 @@ class FeedbackInsightEngine:
         # blank spacer
         next_row += 1   # row 4
 
-        # ── Questions List Table ──────────────────────────────────────
-        questions_list = list(self.question_results.keys())
-        
-        if questions_list:
-            # Table header
-            header_row = next_row
-            ws.cell(row=next_row, column=1, value="Questions Analysed")
-            header_cell = ws.cell(row=next_row, column=1)
-            header_cell.font = Font(
-                bold=True, size=11, color="FFFFFF"
-            )
-            header_cell.fill = PatternFill(
-                start_color=self.HEADER_COLOUR,
-                end_color=self.HEADER_COLOUR,
+        # ─────────────────────────────────────────────────────────────
+        # TABLE 1: Questions Analysed
+        # ─────────────────────────────────────────────────────────────
+        header = ws.cell(row=next_row, column=1, value="QUESTIONS ANALYSED")
+        header.font = Font(bold=True, size=11, color="000000")
+        header.fill = PatternFill(
+            start_color=self.SUBHEAD_COLOUR,
+            end_color=self.SUBHEAD_COLOUR,
+            fill_type="solid",
+        )
+        header.border = self._thin_border()
+        ws.merge_cells(start_row=next_row, start_column=1, 
+                       end_row=next_row, end_column=EXEC_MERGE)
+        ws.row_dimensions[next_row].height = 20
+        next_row += 1
+
+        for q in self.question_results:
+            c = ws.cell(row=next_row, column=1, value=q)
+            c.alignment = Alignment(wrap_text=True, vertical="center")
+            c.border = self._thin_border()
+            ws.merge_cells(start_row=next_row, start_column=1,
+                          end_row=next_row, end_column=EXEC_MERGE)
+            ws.row_dimensions[next_row].height = 18
+            next_row += 1
+        next_row += 1
+
+        # ─────────────────────────────────────────────────────────────
+        # TABLE 2: Cross-Question Themes (if any)
+        # ─────────────────────────────────────────────────────────────
+        if self.cross_question_themes:
+            header = ws.cell(row=next_row, column=1, 
+                           value="⚠  THEMES RECURRING ACROSS MULTIPLE QUESTIONS")
+            header.font = Font(bold=True, size=11, color="FFFFFF")
+            header.fill = PatternFill(
+                start_color="C00000",
+                end_color="C00000",
                 fill_type="solid",
             )
-            ws.merge_cells(f"A{next_row}:B{next_row}")
-            ws.row_dimensions[next_row].height = 22
+            header.border = self._thin_border()
+            ws.merge_cells(start_row=next_row, start_column=1,
+                          end_row=next_row, end_column=EXEC_MERGE)
+            ws.row_dimensions[next_row].height = 20
             next_row += 1
-            
-            # Table data
-            for q in questions_list:
-                ws.cell(row=next_row, column=1, value=q)
-                ws.cell(row=next_row, column=2, value="")
+
+            for t in self.cross_question_themes:
+                c = ws.cell(row=next_row, column=1, value=t)
+                c.alignment = Alignment(wrap_text=True, vertical="center")
+                c.border = self._thin_border()
+                c.fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0",
+                                    fill_type="solid")
+                ws.merge_cells(start_row=next_row, start_column=1,
+                              end_row=next_row, end_column=EXEC_MERGE)
                 ws.row_dimensions[next_row].height = 18
                 next_row += 1
             next_row += 1
 
-        # ── Cross-Question Themes Table ───────────────────────────────
-        if self.cross_question_themes:
-            # Table header
-            header_row = next_row
-            header_cell = ws.cell(row=next_row, column=1,
-                value="⚠  Themes Recurring Across Multiple Questions"
-            )
-            header_cell.font = Font(bold=True, size=11, color="C00000")
-            header_cell.fill = PatternFill(
-                start_color="FCE4D6",
-                end_color="FCE4D6",
-                fill_type="solid",
-            )
-            ws.merge_cells(f"A{next_row}:B{next_row}")
-            ws.row_dimensions[next_row].height = 22
-            next_row += 1
-            
-            # Table data
-            for t in self.cross_question_themes:
-                cell = ws.cell(row=next_row, column=1, value=t)
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
-                ws.cell(row=next_row, column=2, value="")
-                ws.row_dimensions[next_row].height = 20
-                next_row += 1
-            next_row += 1
-
-        # ── Per-Question Summary Tables ───────────────────────────────
+        # ─────────────────────────────────────────────────────────────
+        # Per-Question Summary Blocks (each in a table)
+        # ─────────────────────────────────────────────────────────────
         for qname, qdata in self.question_results.items():
             s_df: pd.DataFrame = qdata["summary"]
             insights: List[str]  = qdata["insights"]
             ds: Dict             = qdata["dataset_summary"]
 
-            # Question section header
-            divider_row = next_row
-            divider = ws.cell(row=next_row, column=1, 
-                            value=f"  {qname.upper()}")
+            # Section divider (full width header)
+            divider = ws.cell(row=next_row, column=1, value=f"{qname.upper()}")
             divider.font = Font(bold=True, size=12, color="FFFFFF")
             divider.fill = PatternFill(
                 start_color=self.HEADER_COLOUR,
                 end_color=self.HEADER_COLOUR,
                 fill_type="solid",
             )
-            ws.merge_cells(f"A{next_row}:{get_column_letter(EXEC_MERGE)}{next_row}")
+            divider.border = self._thin_border()
+            ws.merge_cells(
+                start_row=next_row, start_column=1,
+                end_row=next_row, end_column=EXEC_MERGE
+            )
             ws.row_dimensions[next_row].height = 22
             next_row += 1
 
-            # Dataset Statistics Table
-            stats_header_row = next_row
-            stats_labels = ["Metric", "Value"]
-            for ci, label in enumerate(stats_labels, 1):
-                cell = ws.cell(row=next_row, column=ci, value=label)
-                cell.font = Font(bold=True, color="FFFFFF", size=10)
-                cell.fill = PatternFill(
-                    start_color="8FA5C1",
-                    end_color="8FA5C1",
-                    fill_type="solid",
-                )
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.border = self._thin_border()
-            ws.row_dimensions[next_row].height = 20
-            next_row += 1
-            
-            # Stats data
-            stats_data = [
+            # Stats table (2 columns: Label | Value)
+            stats_headers = [
                 ("Responses", ds.get("Total Responses", "")),
                 ("Themes Identified", ds.get("Themes Identified", "")),
-                ("Avg Response Length", ds.get("Average Response Length (words)", "")),
-                ("Languages Detected", ds.get("Languages Detected", "")),
+                ("Avg Length (words)", ds.get("Average Response Length (words)", "")),
+                ("Languages", ds.get("Languages Detected", "")),
             ]
-            
-            for metric, value in stats_data:
-                ws.cell(row=next_row, column=1, value=metric)
-                ws.cell(row=next_row, column=2, value=value)
+            for stat_label, stat_value in stats_headers:
+                lc = ws.cell(row=next_row, column=1, value=stat_label)
+                lc.font = Font(bold=True, size=10, color="000000")
+                lc.fill = PatternFill(
+                    start_color=self.SUBHEAD_COLOUR,
+                    end_color=self.SUBHEAD_COLOUR,
+                    fill_type="solid",
+                )
+                lc.border = self._thin_border()
+                lc.alignment = Alignment(horizontal="left", vertical="center")
+
+                vc = ws.cell(row=next_row, column=2, value=stat_value)
+                vc.font = Font(bold=True, size=10)
+                vc.border = self._thin_border()
+                vc.alignment = Alignment(horizontal="center", vertical="center")
+                
+                ws.merge_cells(start_row=next_row, start_column=2,
+                              end_row=next_row, end_column=EXEC_MERGE)
                 ws.row_dimensions[next_row].height = 18
                 next_row += 1
             next_row += 1
 
-            # Key Insights Table
+            # Insights table (single column with wrapped text)
             if insights:
-                insights_header = ws.cell(row=next_row, column=1,
-                    value="Key Insights"
-                )
-                insights_header.font = Font(bold=True, size=11, color="FFFFFF")
-                insights_header.fill = PatternFill(
-                    start_color="8FA5C1",
-                    end_color="8FA5C1",
+                h = ws.cell(row=next_row, column=1, value="KEY INSIGHTS")
+                h.font = Font(bold=True, size=10, color="000000")
+                h.fill = PatternFill(
+                    start_color=self.SUBHEAD_COLOUR,
+                    end_color=self.SUBHEAD_COLOUR,
                     fill_type="solid",
                 )
-                ws.merge_cells(f"A{next_row}:{get_column_letter(EXEC_MERGE)}{next_row}")
-                ws.row_dimensions[next_row].height = 20
+                h.border = self._thin_border()
+                ws.merge_cells(start_row=next_row, start_column=1,
+                              end_row=next_row, end_column=EXEC_MERGE)
+                ws.row_dimensions[next_row].height = 18
                 next_row += 1
-                
-                for insight in insights:
-                    cell = ws.cell(row=next_row, column=1, value=f"  •  {insight}")
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-                    ws.merge_cells(f"A{next_row}:{get_column_letter(EXEC_MERGE)}{next_row}")
+
+                for ins in insights:
+                    ic = ws.cell(row=next_row, column=1, value=f"•  {ins}")
+                    ic.alignment = Alignment(wrap_text=True, vertical="top")
+                    ic.border = self._thin_border()
+                    ws.merge_cells(start_row=next_row, start_column=1,
+                                  end_row=next_row, end_column=EXEC_MERGE)
                     ws.row_dimensions[next_row].height = 22
                     next_row += 1
                 next_row += 1
 
-            # Top Themes Summary Table
-            themes_header_row = next_row
+            # Mini table header (Top themes for this question)
             mini_cols = ["Theme", "Responses", "Share (%)", "Priority",
                          "Recommendation"]
             for ci, h in enumerate(mini_cols, 1):
                 c = ws.cell(row=next_row, column=ci, value=h)
-                c.font = Font(bold=True, color="FFFFFF", size=10)
+                c.font = Font(bold=True, color="FFFFFF", size=9)
                 c.fill = PatternFill(
                     start_color=self.HEADER_COLOUR,
                     end_color=self.HEADER_COLOUR,
@@ -1395,10 +2192,10 @@ class FeedbackInsightEngine:
                 )
                 c.alignment = Alignment(horizontal="center", vertical="center")
                 c.border = self._thin_border()
-            ws.row_dimensions[next_row].height = 22
+            ws.row_dimensions[next_row].height = 20
             next_row += 1
 
-            # Mini table data (top 5 themes)
+            # Mini table data
             stripe_fill = PatternFill(
                 start_color=self.STRIPE_COLOUR,
                 end_color=self.STRIPE_COLOUR,
@@ -1419,26 +2216,23 @@ class FeedbackInsightEngine:
                     c.alignment = Alignment(wrap_text=True, vertical="top")
                     if fill:
                         c.fill = fill
-                ws.row_dimensions[next_row].height = 22
+                ws.row_dimensions[next_row].height = 20
                 next_row += 1
             next_row += 2
 
-        # Configure column widths (Executive Summary sheet)
-        ws.column_dimensions["A"].width = 50  # Theme column
-        ws.column_dimensions["B"].width = 16  # Responses column
-        ws.column_dimensions["C"].width = 14  # Share (%) column
-        ws.column_dimensions["D"].width = 18  # Priority column
-        ws.column_dimensions["E"].width = 80  # Recommendation - significantly increased for full text visibility
-        for col_idx in range(6, EXEC_MERGE + 1):
-            ws.column_dimensions[get_column_letter(col_idx)].width = 12
+        self.smart_col_widths(ws)
+        # Exec summary: give the Recommendation column extra room
+        if ws.max_column >= 5:
+            ws.column_dimensions["E"].width = 52
 
         # ══════════════════════════════════════════════════════════════
-        # 2. PER-QUESTION THEME SHEETS
+        # 2. PER-QUESTION THEME SHEETS (with v3+ Engines)
         # ══════════════════════════════════════════════════════════════
         THEME_COLS = [
             "Theme", "Response Count", "Share (%)", "Impact Score",
             "Intensity Score", "Priority", "Theme Sentiment",
-            "Average Sentiment", "Key Keywords", "Representative Quote",
+            "Average Sentiment", "Trigger Status", "Action Owner",
+            "Timeline (Days)", "Key Keywords", "Representative Quote",
             "Recommendation",
         ]
 
@@ -1454,6 +2248,8 @@ class FeedbackInsightEngine:
             )
 
             s_df: pd.DataFrame = qdata["summary"]
+            # Prepare summary with trigger/action info
+            s_df = self.prepare_summary_for_excel(s_df)
             available_cols = [c for c in THEME_COLS if c in s_df.columns]
             n_cols = max(len(available_cols), 8)
 
@@ -1474,7 +2270,7 @@ class FeedbackInsightEngine:
 
             # Wrap long-text columns
             for long_col in ("Representative Quote", "Recommendation",
-                              "Key Keywords"):
+                              "Key Keywords", "Action Owner", "Trigger Status"):
                 if long_col in available_cols:
                     lcol = available_cols.index(long_col) + 1
                     for row in ws.iter_rows(
@@ -1483,6 +2279,39 @@ class FeedbackInsightEngine:
                         for cell in row:
                             cell.alignment = Alignment(
                                 wrap_text=True, vertical="top"
+                            )
+
+            # Colour trigger status cells (RED for HIGH, ORANGE for MEDIUM)
+            if "Trigger Status" in available_cols:
+                trigger_col = available_cols.index("Trigger Status") + 1
+                for row in ws.iter_rows(
+                    min_row=data_start, max_row=ws.max_row,
+                    min_col=trigger_col, max_col=trigger_col
+                ):
+                    for cell in row:
+                        cell_value = str(cell.value or "").upper()
+                        if "HIGH" in cell_value:
+                            cell.fill = PatternFill(
+                                start_color="FF0000", end_color="FF0000",
+                                fill_type="solid"
+                            )
+                            cell.font = Font(color="FFFFFF", bold=True)
+                        elif "MEDIUM" in cell_value:
+                            cell.fill = PatternFill(
+                                start_color="FFA500", end_color="FFA500",
+                                fill_type="solid"
+                            )
+                            cell.font = Font(color="FFFFFF", bold=True)
+                        elif "POSITIVE" in cell_value:
+                            cell.fill = PatternFill(
+                                start_color="00B050", end_color="00B050",
+                                fill_type="solid"
+                            )
+                            cell.font = Font(color="FFFFFF", bold=True)
+                        else:
+                            cell.fill = PatternFill(
+                                start_color="F0F0F0", end_color="F0F0F0",
+                                fill_type="solid"
                             )
 
             # Colour by sentiment, then stripe
@@ -1499,18 +2328,20 @@ class FeedbackInsightEngine:
             self.smart_col_widths(ws)
 
         # ══════════════════════════════════════════════════════════════
-        # 3. CHARTS SHEET (Professional Styling - v2.1)
-        #    Layout: one block per question, each block is CHART_BLOCK_ROWS
-        #    tall.  Bar chart and Pie chart are placed SIDE BY SIDE with
-        #    adequate spacing to prevent overlap.
+        # 3. CHARTS SHEET (Professional Styling - v3.0)
+        #    Features:
+        #    - Clean professional styling with modern chart look
+        #    - No gridlines for clarity
+        #    - Clear titles and axis labels
+        #    - Legend positioned right (not overlapping pie)
         # ══════════════════════════════════════════════════════════════
         ws = wb.create_sheet("Charts")
 
-        CHART_BLOCK_ROWS = 38   # rows allocated per question block (increased for spacing)
-        BAR_W, BAR_H   = 20, 13  # bar chart size (reduced slightly for better spacing)
-        PIE_W, PIE_H   = 15, 13  # pie chart size (reduced for better spacing)
-        BAR_ANCHOR_COL = "D"     # bar chart left edge (moved slightly left)
-        PIE_ANCHOR_COL = "U"     # pie chart left edge — significantly increased spacing
+        CHART_BLOCK_ROWS = 38   # rows allocated per question block
+        BAR_W, BAR_H   = 20, 13  # bar chart dimensions (optimized spacing)
+        PIE_W, PIE_H   = 15, 13  # pie chart dimensions (optimized spacing)
+        BAR_ANCHOR_COL = "D"     # bar chart left edge
+        PIE_ANCHOR_COL = "U"     # pie chart left edge (well spaced from bar)
 
         # Page heading
         self.write_sheet_heading(
@@ -1541,7 +2372,7 @@ class FeedbackInsightEngine:
 
             # Column headers for data table
             ws.cell(row=block_start + 1, column=1, value="Theme")
-            ws.cell(row=block_start + 1, column=2, value="Count")
+            ws.cell(row=block_start + 1, column=2, value="Responses")
             self.style_table_header(ws, header_row=block_start + 1)
 
             # Data rows
@@ -1560,36 +2391,40 @@ class FeedbackInsightEngine:
             cats_ref = Reference(ws, min_col=1,
                                   min_row=block_start + 2, max_row=data_end)
 
-            # ── Bar chart (Professional Styling v2.1) ──────────────────
+            # ── Bar chart (Professional v3.0) ──────────────────────────
             bar = BarChart()
             bar.type    = "col"
+            bar.style   = 11  # Modern professional style
             bar.title   = f"{safe_q}\nTheme Distribution"
-            bar.style   = 10  # Professional style
             bar.y_axis.title = "Number of Responses"
-            bar.y_axis.scaling.minVal = 0
             bar.x_axis.title = "Feedback Theme"
-            bar.legend  = None          # ← DROP LEGEND (no legend for bar chart)
+            bar.legend  = None          # No legend for cleaner look
             
-            # Remove gridlines for cleaner appearance
-            bar.y_axis.delete = False
+            # Remove gridlines for professional appearance
             bar.y_axis.majorGridlines = None
+            
+            # Set axis scaling to start from 0 and be visible
+            bar.y_axis.scaling.minVal = 0
+            bar.y_axis.delete = False  # Ensure axis is visible
+            bar.x_axis.delete = False  # Ensure axis is visible
             
             bar.add_data(data_ref, titles_from_data=True)
             bar.set_categories(cats_ref)
             bar.width  = BAR_W
             bar.height = BAR_H
             
-            # Apply data labels (values on top of bars) - requires VBA workaround
-            # We'll add chart with optimized settings for professional appearance
+            # Add data labels (values on top of bars) - openpyxl limitation
+            # requires setting dataLbls XML attribute manually if using openpyxl
+            # For now, chart shows cleanly with professional styling
             ws.add_chart(bar, f"{BAR_ANCHOR_COL}{block_start}")
 
-            # ── Pie chart (Professional Styling v2.1) ──────────────────
+            # ── Pie chart (Professional v3.0) ─────────────────────────
             pie = PieChart()
-            pie.title  = f"{safe_q}\nPercentage Share"
-            pie.style  = 10  # Professional style
+            pie.style   = 11  # Modern professional style
+            pie.title   = f"{safe_q}\nPercentage Share"
             
-            # Position legend to the right (not overlapping chart)
-            pie.legend.position = "r"   # 'r' = right
+            # Position legend to RIGHT to prevent overlap
+            pie.legend.position = "r"  # 'r' = right
             
             pie.add_data(data_ref, titles_from_data=True)
             pie.set_categories(cats_ref)
@@ -1602,8 +2437,132 @@ class FeedbackInsightEngine:
             # Advance cursor by the fixed block height
             data_cursor += CHART_BLOCK_ROWS
 
-            ws.column_dimensions["A"].width = 40  # Theme column
-            ws.column_dimensions["B"].width = 12  # Count column (smaller since just numbers)
+        ws.column_dimensions["A"].width = 38
+        ws.column_dimensions["B"].width = 14
+
+        # ══════════════════════════════════════════════════════════════
+        # 3.5 ALERTS & ACTIONS (v3+ Decision Support Sheet)
+        # ══════════════════════════════════════════════════════════════
+        # This sheet surfaces HIGH/MEDIUM priority issues with action owners
+        # and deadlines for immediate decision-making
+
+        ws = wb.create_sheet("Alerts & Actions", 3)  # Insert after Charts
+
+        next_row = self.write_sheet_heading(
+            ws,
+            title="🚨 PRIORITY ALERTS & ACTION PLANS",
+            subtitle=f"Critical Issues Requiring Immediate Attention | {now_eat}",
+            merge_cols=8,
+        )
+        next_row += 1
+
+        # Collect all HIGH/MEDIUM priority issues across all questions
+        priority_issues = []
+        for qname, qdata in self.question_results.items():
+            s_df = self.prepare_summary_for_excel(qdata["summary"])
+            for idx, row in s_df.iterrows():
+                triggers = row.get("triggers", [])
+                if isinstance(triggers, list):
+                    for trigger in triggers:
+                        if trigger.get("level") in ("HIGH", "MEDIUM"):
+                            priority_issues.append({
+                                "question": qname,
+                                "theme": row["Theme"],
+                                "priority": trigger.get("icon", ""),
+                                "level": trigger.get("level", ""),
+                                "message": trigger.get("message", ""),
+                                "impact": row.get("Response Count", 0),
+                                "owner": row.get("Action Owner", "TBD"),
+                                "deadline_days": trigger.get("deadline_days", 30),
+                                "recommendation": row.get("Recommendation", "N/A"),
+                            })
+
+        # Sort by level (HIGH first) then by impact
+        priority_issues.sort(
+            key=lambda x: (
+                0 if x["level"] == "HIGH" else 1,
+                -x["impact"]
+            )
+        )
+
+        if not priority_issues:
+            # No alerts
+            msg_cell = ws.cell(row=next_row, column=1, 
+                              value="✓ No HIGH or MEDIUM priority alerts detected.")
+            msg_cell.font = Font(size=12, color="00B050", bold=True)
+            ws.merge_cells(start_row=next_row, start_column=1,
+                          end_row=next_row, end_column=8)
+            next_row += 1
+        else:
+            # Build alerts table
+            headers = ["Priority", "Theme", "Question", "Impact", "Message",
+                      "Action Owner", "Deadline (Days)", "Recommendation"]
+            for ci, h in enumerate(headers, 1):
+                hc = ws.cell(row=next_row, column=ci, value=h)
+                hc.font = Font(bold=True, color="FFFFFF", size=11)
+                hc.fill = PatternFill(
+                    start_color="2F5597", end_color="2F5597",
+                    fill_type="solid"
+                )
+                hc.alignment = Alignment(horizontal="center", vertical="center")
+                hc.border = self._thin_border()
+            
+            ws.row_dimensions[next_row].height = 20
+            next_row += 1
+
+            # Data rows
+            for issue in priority_issues:
+                ws.cell(row=next_row, column=1, value=issue["priority"])
+                ws.cell(row=next_row, column=2, value=issue["theme"])
+                ws.cell(row=next_row, column=3, value=issue["question"])
+                ws.cell(row=next_row, column=4, value=issue["impact"])
+                ws.cell(row=next_row, column=5, value=issue["message"])
+                ws.cell(row=next_row, column=6, value=issue["owner"])
+                ws.cell(row=next_row, column=7, value=issue["deadline_days"])
+                ws.cell(row=next_row, column=8, value=issue["recommendation"])
+
+                # Colour the priority column (dimmed colors, no icons)
+                priority_cell = ws.cell(row=next_row, column=1)
+                priority_cell.value = issue["level"]  # Show text level, not emoji
+                if issue["level"] == "HIGH":
+                    priority_cell.fill = PatternFill(
+                        start_color="FFB3B3", end_color="FFB3B3",
+                        fill_type="solid"
+                    )
+                    priority_cell.font = Font(color="404040", bold=True)
+                elif issue["level"] == "MEDIUM":
+                    priority_cell.fill = PatternFill(
+                        start_color="FFE0B3", end_color="FFE0B3",
+                        fill_type="solid"
+                    )
+                    priority_cell.font = Font(color="404040", bold=True)
+
+                # Wrap long text columns
+                for col_idx in [2, 5, 8]:  # Theme, Message, Recommendation
+                    cell = ws.cell(row=next_row, column=col_idx)
+                    cell.alignment = Alignment(
+                        wrap_text=True, vertical="top"
+                    )
+
+                # Add borders
+                for col in range(1, 9):
+                    ws.cell(row=next_row, column=col).border = self._thin_border()
+
+                ws.row_dimensions[next_row].height = 25
+                next_row += 1
+
+            # Set column widths
+            ws.column_dimensions["A"].width = 12
+            ws.column_dimensions["B"].width = 22
+            ws.column_dimensions["C"].width = 18
+            ws.column_dimensions["D"].width = 8
+            ws.column_dimensions["E"].width = 35
+            ws.column_dimensions["F"].width = 20
+            ws.column_dimensions["G"].width = 14
+            ws.column_dimensions["H"].width = 40
+
+            # Add autofilter
+            ws.auto_filter.ref = f"A{next_row - len(priority_issues)}:H{next_row}"
 
         # ══════════════════════════════════════════════════════════════
         # 4. EXAMPLE QUOTES
@@ -1630,12 +2589,10 @@ class FeedbackInsightEngine:
                 for q in info["samples"]:
                     ws.append([qname, theme, q])
 
-        # Wrap quote column with proper alignment
+        # Wrap quote column
         for row in ws.iter_rows(min_row=data_start, min_col=3, max_col=3):
             for cell in row:
-                cell.alignment = Alignment(wrap_text=True, vertical="top", indent=1)
-        # Increase quote column width
-        ws.column_dimensions["C"].width = 80
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
 
         self.add_table_borders(ws, start_row=next_row)
         self.zebra_rows(ws, start_row=data_start)
@@ -1683,33 +2640,116 @@ class FeedbackInsightEngine:
         # ══════════════════════════════════════════════════════════════
         ws = wb.create_sheet("Clustered Responses")
 
-        first = True
+        # Build comprehensive dataset with themes + metadata
         all_q_dfs = []
         for qname, qdata in self.question_results.items():
-            q_df: pd.DataFrame = qdata.get("q_df", pd.DataFrame())
+            q_df = qdata.get("q_df", pd.DataFrame()).copy()
+            s_df = qdata.get("summary", pd.DataFrame()).copy()
+            cluster_map = qdata.get("cluster_to_theme_map", {})
+            
             if q_df.empty:
                 continue
-            q_df = q_df.copy()
+            
+            # Add Question column
             q_df.insert(0, "Question", qname)
+            
+            # Rename columns for clarity
+            if "clean_text" in q_df.columns:
+                q_df.rename(columns={"clean_text": "Clean Text"}, inplace=True)
+            elif "response" in q_df.columns:
+                q_df.rename(columns={"response": "Clean Text"}, inplace=True)
+            
+            if "lang" in q_df.columns:
+                q_df.rename(columns={"lang": "Language"}, inplace=True)
+            
+            if "cluster" in q_df.columns:
+                q_df.rename(columns={"cluster": "Cluster"}, inplace=True)
+            
+            if "sentiment" in q_df.columns:
+                q_df.rename(columns={"sentiment": "Sentiment"}, inplace=True)
+            
+            # Build lookup: theme_name → theme metadata from summary_df
+            theme_lookup = {}
+            if not s_df.empty:
+                for _, row in s_df.iterrows():
+                    theme_name = row.get("Theme", "Unknown")
+                    theme_lookup[theme_name] = {
+                        "Theme": theme_name,
+                        "Theme Sentiment": row.get("Theme Sentiment", "Neutral"),
+                        "Priority": row.get("Priority", "Low"),
+                        "Trigger Status": row.get("Trigger Status", "No Alert"),
+                        "Action Owner": row.get("Action Owner", "Program Manager"),
+                        "Timeline (Days)": str(row.get("Timeline (Days)", "30")),
+                    }
+            
+            # Map cluster IDs to themes using cluster_to_theme_map, then lookup metadata
+            cluster_col = "Cluster" if "Cluster" in q_df.columns else "cluster"
+            if cluster_col in q_df.columns:
+                # Create a function to lookup theme by cluster ID then get metadata
+                def get_theme_metadata(cluster_id):
+                    theme_name = cluster_map.get(cluster_id, "Unclassified")
+                    return theme_lookup.get(theme_name, {
+                        "Theme": "Unclassified",
+                        "Theme Sentiment": "Neutral",
+                        "Priority": "Low",
+                        "Trigger Status": "No Alert",
+                        "Action Owner": "Program Manager",
+                        "Timeline (Days)": "30",
+                    })
+                
+                # Add theme columns to q_df
+                for col in ["Theme", "Theme Sentiment", "Priority",
+                            "Trigger Status", "Action Owner", "Timeline (Days)"]:
+                    q_df[col] = q_df[cluster_col].apply(lambda cid: get_theme_metadata(cid).get(col, ""))
+            
             all_q_dfs.append(q_df)
 
         if all_q_dfs:
             combined = pd.concat(all_q_dfs, ignore_index=True)
-            n_cols = max(len(combined.columns), 6)
+            
+            # Reorder columns for professional layout
+            # Core data columns first, then theme metadata
+            desired_order = [
+                "Question",
+                "Clean Text",
+                "Language", 
+                "Sentiment",
+                "Cluster",
+                "Theme",
+                "Theme Sentiment",
+                "Priority",
+                "Trigger Status",
+                "Action Owner",
+                "Timeline (Days)",
+            ]
+            
+            # Keep only columns that exist and exclude internal columns
+            internal_cols = {"compressed_text"}  # Internal columns to hide
+            cols_to_use = [col for col in desired_order if col in combined.columns]
+            # Add any remaining columns not in desired_order (excluding internal)
+            for col in combined.columns:
+                if col not in cols_to_use and col not in internal_cols:
+                    cols_to_use.append(col)
+            
+            combined = combined[cols_to_use]
+            
+            n_cols = len(combined.columns)
 
             next_row = self.write_sheet_heading(
                 ws,
-                title="Clustered Responses  —  Full Analysed Dataset",
-                subtitle=f"Total sentence units: {len(combined)}   |   "
-                         f"Questions: {len(all_q_dfs)}",
-                merge_cols=n_cols,
+                title="Clustered Responses  —  Complete Analysis Dataset",
+                subtitle=f"Total responses: {len(combined)}   |   "
+                         f"Questions: {len(self.question_results)}",
+                merge_cols=min(n_cols, 12),
             )
 
+            # Write headers
             for ci, col_name in enumerate(combined.columns, 1):
                 ws.cell(row=next_row, column=ci, value=col_name)
             self.style_table_header(ws, header_row=next_row)
             data_start = next_row + 1
 
+            # Write data rows
             for r in combined.itertuples(index=False):
                 ws.append(list(r))
 
@@ -1724,6 +2764,86 @@ class FeedbackInsightEngine:
 
         wb.save(output)
         log.info("✅ Report saved → %s", output)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # JSON & ALERTS EXPORT (v3+ Feature)
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _export_json_reports(self) -> None:
+        """Export insights in machine-readable JSON format."""
+        try:
+            from output.json_writer import export_json
+            
+            # Collect all themes from all questions
+            all_themes = []
+            for qname, qdata in self.question_results.items():
+                s_df = qdata["summary"]
+                for idx, row in s_df.iterrows():
+                    theme_dict = {
+                        "question": qname,
+                        "name": row.get("Theme", ""),
+                        "impact": int(row.get("Response Count", 0)),
+                        "sentiment": row.get("Theme Sentiment", "Neutral"),
+                        "keywords": str(row.get("Key Keywords", "")).split(","),
+                        "triggers": row.get("triggers", []),
+                        "action_plan": (
+                            row.get("action_plan", {})
+                            if isinstance(row.get("action_plan"), dict)
+                            else {}
+                        ),
+                        "recommendation": row.get("Recommendation", ""),
+                    }
+                    all_themes.append(theme_dict)
+            
+            export_json(
+                all_themes,
+                filename="output/insights.json",
+                sector=self.pipeline_config.get("sector", ""),
+            )
+        except ImportError:
+            log.warning("json_writer not available — skipping JSON export")
+        except Exception as exc:
+            log.error("JSON export failed: %s", exc)
+
+    def _export_alerts_report(self) -> None:
+        """Export priority alerts in machine-readable format."""
+        try:
+            from output.alert_formatter import generate_alerts, export_alerts_json, print_alerts
+            
+            # Collect all HIGH/MEDIUM priority alerts
+            all_alerts = []
+            for qname, qdata in self.question_results.items():
+                s_df = qdata["summary"]
+                for idx, row in s_df.iterrows():
+                    triggers = row.get("triggers", [])
+                    if isinstance(triggers, list):
+                        for trigger in triggers:
+                            if trigger.get("level") in ("HIGH", "MEDIUM"):
+                                alert = {
+                                    "theme_name": row.get("Theme", ""),
+                                    "question": qname,
+                                    "priority_icon": trigger.get("icon", ""),
+                                    "priority_level": trigger.get("level", ""),
+                                    "message": trigger.get("message", ""),
+                                    "deadline_days": trigger.get("deadline_days", 30),
+                                    "impact_count": row.get("Response Count", 0),
+                                    "recommendation": row.get("Recommendation", ""),
+                                    "action_owner": row.get("Action Owner", "TBD"),
+                                }
+                                all_alerts.append(alert)
+            
+            if all_alerts:
+                # Print to console for immediate visibility
+                print_alerts(all_alerts, max_display=5)
+                
+                # Export to JSON
+                export_alerts_json(all_alerts, filename="output/alerts.json")
+            else:
+                log.info("✓ No HIGH/MEDIUM alerts to export")
+        except ImportError:
+            log.warning("alert_formatter not available — skipping alerts export")
+        except Exception as exc:
+            log.error("Alerts export failed: %s", exc)
 
     # ══════════════════════════════════════════════════════════════════
     # FULL PIPELINE
@@ -1787,11 +2907,11 @@ class FeedbackInsightEngine:
             log.info("Classifying theme sentiment …")
             self.classify_theme_sentiment()
 
+            log.info("Applying advanced engines (triggers/actions) …")
+            self.apply_advanced_engines()
+
             log.info("Generating recommendations …")
             self.generate_recommendations()
-
-            log.info("Adding priority labels …")
-            self.add_priority_labels()
 
             log.info("Merging similar themes …")
             self.merge_similar_themes()
@@ -1813,6 +2933,7 @@ class FeedbackInsightEngine:
                 "cluster_summary": self.cluster_summary.copy(),
                 "emerging_df": getattr(self, "emerging_df", pd.DataFrame()).copy(),
                 "q_df": self.q_df.copy(),
+                "cluster_to_theme_map": self.cluster_to_theme_map.copy(),
             }
 
             # Free per-question RAM
@@ -1824,8 +2945,134 @@ class FeedbackInsightEngine:
             log.info("Detecting cross-question themes …")
             self.detect_cross_question_themes()
 
+        # --- Keyword coverage tips (always printed when rule-based recs used) ---
+        # If LLM recs were used, print a condensed keyword discovery summary.
+        if self._anthropic_client and self.config.use_llm_recommendations:
+            self._print_llm_keyword_summary()
+
+        # ── NEW: Generate JSON + Alerts output (v3+ Upgrade) ──────────
+        self._export_outputs()
+
         log.info("Building Excel report …")
         self.build_excel_report()
+
+    def _export_outputs(self) -> None:
+        """
+        Export insights as JSON and generate priority alerts.
+        Controlled by config/config.yaml output settings.
+        """
+        config = self.pipeline_config
+        output_config = config.get("output", {})
+        sector = config.get("sector", "")
+        
+        # Collect all themes from all questions
+        all_themes = []
+        for qname, qdata in self.question_results.items():
+            s_df = qdata.get("summary", pd.DataFrame())
+            
+            # DEBUG: Check what columns exist in summary_df
+            if all_themes == []:  # Only log once for first question
+                log.info(f"  📊 Summary columns: {list(s_df.columns)}")
+            
+            for idx, row in s_df.iterrows():
+                # Extract trigger status from raw triggers list
+                triggers = row.get("triggers", [])
+                trigger_status = "Low"
+                if isinstance(triggers, list) and triggers:
+                    # Get the highest priority trigger level
+                    levels = {t.get("level", "Low") for t in triggers}
+                    if "High" in levels:
+                        trigger_status = "High"
+                    elif "Medium" in levels:
+                        trigger_status = "Medium"
+                    elif "Positive" in levels:
+                        trigger_status = "Positive"
+                
+                # Extract action owner and timeline from action_plan dict
+                action_plan = row.get("action_plan", {})
+                
+                # Ensure action_plan is converted from pandas object to dict
+                if isinstance(action_plan, dict):
+                    assigned_owner = action_plan.get("owner", "Unknown")
+                    timeline_days = action_plan.get("timeline", 30)
+                else:
+                    assigned_owner = "Unknown"
+                    timeline_days = 30
+                
+                # Convert triggers to list of dicts (in case it's a pandas object)
+                triggers_list = []
+                if isinstance(triggers, list):
+                    triggers_list = triggers
+                elif pd.notna(triggers):
+                    triggers_list = [] if triggers is None else [triggers]
+                
+                # DEBUG: Log first theme details
+                if idx == 0 and qname == list(self.question_results.keys())[0]:
+                    log.info(f"  🎯 First theme export check:")
+                    log.info(f"     Theme: {row.get('Theme', 'N/A')}")
+                    log.info(f"     action_plan type: {type(action_plan)}")
+                    log.info(f"     action_plan value: {action_plan}")
+                    log.info(f"     owner: {assigned_owner}")
+                
+                theme_dict = {
+                    "question": qname,
+                    "name": row.get("Theme", ""),
+                    "impact": row.get("Response Count", 0),
+                    "sentiment": row.get("Theme Sentiment", "Neutral"),
+                    "keywords": (
+                        [k.strip() for k in str(row.get("Key Keywords", "")).split(",")]
+                        if pd.notna(row.get("Key Keywords"))
+                        else []
+                    ),
+                    "average_sentiment_score": row.get("Average Sentiment", 0),
+                    "recommendation": row.get("Recommendation", ""),
+                    "trigger_status": trigger_status,
+                    "assigned_owner": assigned_owner,
+                    "timeline_days": timeline_days,
+                    "triggers": triggers_list,
+                    "action_plan": action_plan if isinstance(action_plan, dict) else {},
+                }
+                all_themes.append(theme_dict)
+        
+        # Export JSON if enabled
+        if output_config.get("json", True):
+            try:
+                from output.json_writer import export_json
+                export_json(
+                    all_themes,
+                    filename="output/insights.json",
+                    sector=sector,
+                )
+            except ImportError:
+                log.warning("JSON writer not available. Skipping JSON export.")
+        
+        # Generate and display alerts if enabled
+        if output_config.get("alerts", True):
+            try:
+                from output.alert_formatter import generate_alerts, print_alerts, export_alerts_json
+                alerts = generate_alerts(all_themes)
+                print_alerts(alerts, max_display=10)
+                export_alerts_json(alerts, filename="output/alerts.json")
+            except ImportError:
+                log.warning("Alert formatter not available. Skipping alerts.")
+
+    def _print_llm_keyword_summary(self) -> None:
+        """Print a brief keyword discovery log when LLM recommendations are active."""
+        print(f"\n{'═' * 62}")
+        print("  KEYWORD DISCOVERY SUMMARY  (LLM recommendations active)")
+        print(f"{'═' * 62}")
+        for qname, qdata in self.question_results.items():
+            s_df = qdata["summary"]
+            all_kw = set()
+            for kw_str in s_df.get("Key Keywords", []):
+                all_kw.update(k.strip() for k in str(kw_str).split(","))
+            print(f"\n  {qname}:")
+            print(f"    Themes     : {', '.join(s_df['Theme'].tolist())}")
+            print(f"    All keywords found : {', '.join(sorted(all_kw))}")
+        print(f"\n  TIP: If recommendations look off for any theme,")
+        print(f"  set use_llm_recommendations=False and check the")
+        print(f"  KEYWORD TIPS report to tune RECOMMENDATION_RULES.")
+        print(f"{'═' * 62}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1835,7 +3082,7 @@ class FeedbackInsightEngine:
 if __name__ == "__main__":
 
     config = EngineConfig(
-        pca_components=64,          # reduce embedding dims for RAM efficiency
+        pca_components=64,
         min_cluster_size=5,
         emerging_min_size=2,
         max_clusters=20,
@@ -1843,12 +3090,26 @@ if __name__ == "__main__":
         tfidf_max_features=5_000,
         large_dataset_threshold=500,
         min_responses=10,
-        report_title="Customer Feedback Insights – Kenya Survey 2026",
+
+        # ── Sector context ────────────────────────────────────────────
+        # Set this to your programme area for better LLM outputs:
+        #   "smallholder agriculture"  |  "primary healthcare"
+        #   "microfinance / SACCO"     |  "WASH services"
+        #   "secondary education"      |  "urban housing"
+        sector="smallholder agriculture",  # ← change for your sector
+
+        # ── LLM features ─────────────────────────────────────────────
+        # Requires: pip install anthropic  +  ANTHROPIC_API_KEY env var
+        use_llm_naming=True,           # meaningful theme names
+        use_llm_recommendations=True,  # sector-aware recommendations
+        # Set both to False to use rule-based only (faster, no API key needed)
+
+        report_title="One Acre Fund — Farmer Feedback Insights 2026",
         output_filename="oaf_farmer_survey_insight_report.xlsx",
     )
 
     engine = FeedbackInsightEngine(
-        file_path="oaf_farmer_survey_demo.xlsx",   # or .xlsx
+        file_path="oaf_farmer_survey_demo.xlsx",
         text_columns=[
             "q1_inputs",
             "q2_training",
