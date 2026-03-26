@@ -1296,8 +1296,13 @@ class FeedbackInsightEngine:
                 elif any(l == "POSITIVE" for l in levels):
                     priority_label = "Positive"
 
+            # ── CRITICAL: feed priority back into theme_input so that
+            #    action_engine.timeline() uses the correct value.
+            #    Without this line, timeline() always defaults to "MEDIUM" → 30 days.
+            theme_input["priority"] = priority_label
+
             # Trend is REMOVED — TriggerEngine is the single source of truth for priority
-            
+
             # Action plan
             action_plan = {}
             if getattr(self, "action_engine", None) and self.pipeline_config.get("features", {}).get("enable_action_engine", True):
@@ -1622,8 +1627,18 @@ class FeedbackInsightEngine:
             for cid in cluster_ids:
                 self.cluster_to_theme_map[cid] = main_theme
             
+            # When multiple themes are merged, inherit Priority/Owner/Timeline
+            # from the highest-priority row (HIGH > MEDIUM > POSITIVE > LOW).
+            # This prevents a HIGH-priority theme from being downgraded because
+            # it merged with a LOW one.
+            PRIORITY_RANK = {"HIGH": 4, "MEDIUM": 3, "POSITIVE": 2, "LOW": 1, "": 0}
+            best_idx = subset["Priority"].map(
+                lambda p: PRIORITY_RANK.get(str(p).upper(), 0)
+            ).idxmax()
+            best_row = subset.loc[best_idx]
+
             row = {
-                "Cluster ID": cluster_ids[0] if cluster_ids else -1,  # Store first cluster ID
+                "Cluster ID": cluster_ids[0] if cluster_ids else -1,
                 "Theme": main_theme,
                 "Response Count": subset["Response Count"].sum(),
                 "Share (%)": round(subset["Share (%)"].sum(), 2),
@@ -1632,12 +1647,34 @@ class FeedbackInsightEngine:
                 "Average Sentiment": round(subset["Average Sentiment"].mean(), 3),
                 "Key Keywords": ", ".join(subset["Key Keywords"].tolist()),
                 "Representative Quote": subset["Representative Quote"].iloc[0],
-                "Recommendation": subset["Recommendation"].iloc[0],
-                "Priority": subset["Priority"].iloc[0],
-                "Trigger Status": subset["Trigger Status"].iloc[0] if "Trigger Status" in subset.columns else "No Alert",
+                "Recommendation": best_row.get("Recommendation", subset["Recommendation"].iloc[0]),
+                "Priority": best_row.get("Priority", "Low"),
+                "Trigger Status": (
+                    best_row.get("Trigger Status", "No Alert")
+                    if "Trigger Status" in subset.columns else "No Alert"
+                ),
+                # ─ Preserve Action Owner and Timeline from the best-priority row ─
+                "Action Owner": (
+                    best_row.get("Action Owner", "Program Manager")
+                    if "Action Owner" in subset.columns else "Program Manager"
+                ),
+                "Timeline (Days)": (
+                    best_row.get("Timeline (Days)", 60)
+                    if "Timeline (Days)" in subset.columns else 60
+                ),
+                "Actions": (
+                    best_row.get("Actions", "No action specified")
+                    if "Actions" in subset.columns else "No action specified"
+                ),
                 # ─ Preserve advanced engine columns ──────────────────
-                "action_plan": subset["action_plan"].iloc[0] if "action_plan" in subset.columns else {},
-                "triggers": subset["triggers"].iloc[0] if "triggers" in subset.columns else [],
+                "action_plan": (
+                    best_row.get("action_plan", {})
+                    if "action_plan" in subset.columns else {}
+                ),
+                "triggers": (
+                    best_row.get("triggers", [])
+                    if "triggers" in subset.columns else []
+                ),
             }
             new_rows.append(row)
 
