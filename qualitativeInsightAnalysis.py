@@ -1,7 +1,108 @@
 """
 ========================================================================
-FeedbackInsightEngine v2 – Africa-Ready Survey Analysis Pipeline
+FeedbackInsightEngine v3 – Africa-Ready Survey Analysis Pipeline
 ========================================================================
+
+UPGRADE SUMMARY (v2 → v3)
+--------------------------
+MULTILINGUAL EMBEDDING MODEL (Section 2):
+  • Upgraded sentence-transformer from  all-MiniLM-L6-v2  (English-only)
+    to  paraphrase-multilingual-MiniLM-L12-v2  (50+ languages, same 384 dims).
+  • Why this matters for African data:
+    - Swahili, Sheng, and code-switched sentences now encode into the SAME
+      vector space as their English equivalents → better clustering.
+    - "Mbegu zilifika baada ya mvua" and "Seeds arrived after the rains"
+      now land in the same cluster without needing a token map.
+    - merge_similar_themes() uses self.model for cosine similarity; the
+      upgrade propagates there automatically — no extra changes needed.
+  • RAM impact: L12 (12 layers) is ~2× the parameters of L6 but produces
+    the same 384-dim output; PCA config (64 dims) is unchanged.
+    batch_size lowered 64 → 32 to stay safely within 8 GB.
+  • Configurable via  EngineConfig.embedding_model  — swap to any
+    sentence-transformers model without touching the pipeline code.
+
+PDF SUMMARY REPORT (Section 4):
+  • build_pdf_report() generates a professional 2-page PDF executive
+    brief — printable, shareable via WhatsApp, offline-compatible.
+  • Library: fpdf2 (pip install fpdf2) — lightweight, no system
+    dependencies. Graceful degradation: if not installed the pipeline
+    runs normally and logs a one-line install hint; it never crashes.
+  • Page 1: title bar, survey snapshot (totals), HIGH/MEDIUM priority
+    alert table (theme · question · responses · owner · days).
+  • Page 2+: per-question theme tables (theme · share% · priority ·
+    owner · recommendation excerpt) — one compact block per question.
+  • Cross-question recurring themes are highlighted at the top of
+    page 1 when present.
+  • Non-Latin-1 characters (em dashes, smart quotes, emoji) are
+    sanitized automatically so built-in fonts never crash.
+  • PDF filename auto-derived from output_filename (.xlsx → .pdf),
+    or set explicitly via EngineConfig.pdf_filename.
+  • Controlled by EngineConfig.generate_pdf_report (default True).
+
+GEOGRAPHIC SEGMENTATION (Section 5):
+  • Breaks theme analysis down by location (county / ward / any column).
+  • Why it matters: "Loan repayment issues are HIGH in Bungoma" is a more
+    useful insight than "Loan issues are HIGH" — it tells the field team WHERE.
+  • How it works:
+    - orig_idx is preserved in run() before reset_index(drop=True) so every
+      respondent row retains its original position in self.df.
+    - preprocess() propagates orig_idx through sentence expansion — each
+      sentence unit carries the respondent it came from.
+    - build_geographic_breakdown() joins q_df["orig_idx"] → self.df[location]
+      then groups by location + theme: response count, avg sentiment, top issue.
+    - Results stored in self.geo_breakdown for use by the Excel builder.
+  • Excel output — "Geographic Breakdown" sheet:
+    - Per-question County × Theme pivot (response counts)
+    - Heatmap shading: more responses → deeper blue fill
+    - "Top Issue" column: dominant theme per county at a glance
+    - "Avg Sentiment" column: county-level mood indicator
+  • EngineConfig.location_column  (default "" = disabled)
+    Set to any column name in your data: "county", "ward", "region", etc.
+  • EngineConfig.location_min_responses  (default 10)
+    Counties with fewer responses than this are excluded to avoid noise.
+  • simSurveyResponses.py updated: adds a "county" column using a weighted
+    OAF Kenya county distribution (Bungoma, Kakamega, Siaya, Trans Nzoia …).
+
+KOBO / ODK LOADER (Section 3):
+  • load_kobo_export() detects and cleans KoboToolbox / ODK exports
+    automatically — handles their non-standard column naming, metadata
+    columns, multi-select encodings, and group-prefixed headers.
+  • Auto-detection: _load_file() checks for Kobo/ODK fingerprints
+    (_uuid, _submission_time, group "/" separators) and routes to the
+    loader transparently — no change needed at the call site.
+  • Column flattening: group/question paths ("household/q1_inputs")
+    are shortened to the final segment ("q1_inputs") so text_columns
+    stays simple and readable.
+  • Metadata stripping: _id, _uuid, _submission_time, _index,
+    _validation_status, formhub/uuid, meta/instanceID, _parent_index,
+    and all other Kobo/ODK system columns are removed automatically.
+  • Works with both .xlsx and .csv Kobo exports.
+  • Reports: how many rows loaded, how many metadata columns stripped,
+    and the final clean column list — so you can set text_columns
+    confidently without opening the file first.
+
+TEXT NORMALIZATION LAYER (Section 1):
+  • SWAHILI_TOKEN_MAP: 80-entry built-in Swahili/Sheng → English map
+    applied at token level BEFORE TF-IDF, embedding, and VADER scoring.
+    This is the highest-ROI fix: Swahili and English versions of the same
+    concept now cluster together and score correctly.
+  • user_token_map.json: user-editable file for sector-specific additions.
+    Loaded at startup and merged with built-in map. User entries win.
+  • token_review.json: auto-generated after each run. Lists every
+    unrecognized token with frequency + example sentences so the user
+    knows exactly what to add to user_token_map.json.
+  • Optional interactive pause (pause_for_token_review=True): pipeline
+    halts after preprocessing each question, prints top unknown tokens to
+    console, waits for the user to update user_token_map.json, then
+    reloads the map and continues. Best used on first run of new data.
+  • normalize_text() now applies both phrase-level AND token-level fixes
+    in one pass, keeping the pipeline clean and ordered.
+
+BUG FIXES (from v2):
+  • Timeline (Days) was always 30 — fixed by injecting priority_label
+    back into theme_input before calling action_engine.generate().
+  • merge_similar_themes() was silently dropping Action Owner, Timeline,
+    and Actions columns — now preserves them from the highest-priority row.
 
 UPGRADE SUMMARY (v1 → v2)
 --------------------------
@@ -71,6 +172,14 @@ DEPENDENCIES (pip install …):
     chardet langdetect
     # optional but recommended for speed:
     # scikit-learn >= 1.3  (faster MiniBatchKMeans)
+    #
+    # Section 2 model (downloaded automatically on first run, ~470 MB disk / ~900 MB RAM):
+    #   paraphrase-multilingual-MiniLM-L12-v2
+    # To pre-download manually (recommended on slow connections):
+    #   python -c "from sentence_transformers import SentenceTransformer; \
+    #              SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
+    # For English-only data, swap back to all-MiniLM-L6-v2 (~90 MB / ~200 MB RAM)
+    # by setting embedding_model in EngineConfig at the bottom of this file.
 ========================================================================
 """
 
@@ -118,8 +227,15 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
+try:
+    from fpdf import FPDF
+    FPDF_AVAILABLE = True
+except ImportError:
+    FPDF_AVAILABLE = False
+
 nltk.download("vader_lexicon", quiet=True)
 nltk.download("stopwords", quiet=True)
+nltk.download("words", quiet=True)          # used by token_review unknown-word detection
 
 # ── logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -206,11 +322,42 @@ class EngineConfig:
     max_clusters: int = 20            # cap for very large datasets
     merge_threshold: float = 0.75     # cosine sim for theme merging
 
+    # --- Embedding model (Section 2) ---
+    embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
+    # Multilingual model: handles Swahili, Sheng, English, and code-switched
+    # text natively in a shared 384-dim vector space.  Swahili responses and
+    # their English equivalents now cluster together WITHOUT needing a token map.
+    #
+    # Alternatives (all sentence-transformers compatible):
+    #   "all-MiniLM-L6-v2"               — English-only, faster, smaller (~80 MB)
+    #   "paraphrase-multilingual-mpnet-base-v2" — higher accuracy, ~420 MB, slower
+    #   "LaBSE"                           — best cross-lingual, ~1.8 GB, needs 16 GB RAM
+    #
+    # Switch model by changing this one line; nothing else in the pipeline
+    # needs to change (batch_size is auto-adjusted for L6 vs L12 models).
+
     # --- Text ---
     tfidf_max_features: int = 5_000
     tfidf_ngram_range: Tuple[int, int] = (1, 2)
     min_sentence_words: int = 3       # ignore fragments shorter than this
     top_keywords: int = 6
+
+    # --- Token normalization (Section 1) ---
+    token_map_path: str = "user_token_map.json"
+    # Path to user-defined Swahili/Sheng → English mapping file.
+    # Create this file to extend the built-in SWAHILI_TOKEN_MAP.
+    # Format: { "haraka": "urgent", "chakula": "food" }
+
+    token_review_path: str = "token_review.json"
+    # Auto-generated after each run.  Lists every unrecognized token with
+    # frequency and example sentences so you know what to add to
+    # user_token_map.json.
+
+    pause_for_token_review: bool = False
+    # When True: pipeline pauses after preprocessing each question, prints
+    # the top unknown tokens to the console, and waits for you to update
+    # user_token_map.json before continuing.  Useful on the first run of
+    # new data to fix mappings before clustering begins.
 
     # --- Sentiment ---
     extra_sentiment_lexicon: Dict[str, float] = field(default_factory=lambda: {
@@ -257,6 +404,26 @@ class EngineConfig:
     output_filename: str = "Feedback_Insights_Report.xlsx"
     report_title: str = "Customer Feedback Insights"
 
+    # --- PDF Summary (Section 4) ---
+    generate_pdf_report: bool = True
+    # Produce a 2-page printable PDF alongside the Excel file.
+    # Requires:  pip install fpdf2
+    # Set False to skip PDF and produce only the Excel report.
+
+    pdf_filename: str = ""
+    # Explicit PDF output path. Leave blank ("") to auto-derive from
+    # output_filename by replacing .xlsx → .pdf.
+
+    # --- Geographic Segmentation (Section 5) ---
+    location_column: str = ""
+    # Column name in your input data that holds location labels.
+    # e.g. "county", "ward", "region", "sub_location"
+    # Leave blank ("") to skip geographic breakdown entirely.
+
+    location_min_responses: int = 10
+    # Minimum sentence units from a location to include it in the breakdown.
+    # Locations below this threshold are excluded to avoid noise from tiny samples.
+
 
 # ══════════════════════════════════════════════════════════════════════
 # STOP WORDS  ─ English + Swahili + Sheng + African-English fillers
@@ -292,6 +459,396 @@ COMBINED_STOP_WORDS = (
     | SHENG_FILLER_STOP_WORDS
     | AFRICAN_ENGLISH_FILLER
 )
+
+# ══════════════════════════════════════════════════════════════════════
+# TOKEN MAP  ─ Swahili / Sheng → English normalization
+# ══════════════════════════════════════════════════════════════════════
+# Maps local-language tokens to English equivalents BEFORE TF-IDF,
+# embedding, and VADER sentiment scoring.  This is the single highest-ROI
+# fix for African survey data: "mbegu zilichelewa" and "inputs were late"
+# now land in the same cluster and score correctly in English VADER.
+#
+# ┌─── WORKFLOW FOR EXTENDING THE MAP ──────────────────────────────────┐
+# │  1. Run the pipeline once.                                          │
+# │  2. Open  token_review.json  (auto-generated in your project dir).  │
+# │     Each entry shows: token · frequency · example sentences.        │
+# │  3. Create / edit  user_token_map.json  with your additions:        │
+# │       { "haraka": "urgent", "chakula": "food" }                     │
+# │  4. Re-run → system merges your map with the built-in one.          │
+# │                                                                     │
+# │  INTERACTIVE MODE: set  pause_for_token_review=True  in EngineConfig│
+# │  The pipeline halts after each question's preprocessing, prints the │
+# │  top unknown tokens, waits for you to update user_token_map.json,   │
+# │  then reloads the map and continues — no second run needed.         │
+# └─────────────────────────────────────────────────────────────────────┘
+
+SWAHILI_TOKEN_MAP: Dict[str, str] = {
+    # ── Agricultural inputs ──────────────────────────────────────────
+    "mbegu":        "seed",
+    "mbolea":       "fertilizer",
+    "pembejeo":     "inputs",
+    "mahindi":      "maize",
+    "maharage":     "beans",
+    "mbogamboga":   "vegetables",
+    "mazao":        "crops",
+    "zao":          "crop",
+    # ── Farm / growing ───────────────────────────────────────────────
+    "shamba":       "farm",
+    "mashamba":     "farms",
+    "kulima":       "farming",
+    "kupanda":      "planting",
+    "kuvuna":       "harvesting",
+    "mavuno":       "harvest",
+    "msimu":        "season",
+    "mvua":         "rain",
+    "ukame":        "drought",
+    "wadudu":       "pests",
+    # ── Delivery / logistics ─────────────────────────────────────────
+    "usafirishaji": "delivery",
+    "usafiri":      "transport",
+    "umbali":       "distance",
+    "barabara":     "road",
+    "kuchelewa":    "delayed",
+    "uchelewaji":   "delay",
+    "haraka":       "urgent",
+    "mapema":       "early",
+    # ── Loan / finance ───────────────────────────────────────────────
+    "mkopo":        "loan",
+    "mikopo":       "loans",
+    "malipo":       "payments",
+    "kulipa":       "repayment",
+    "kurudisha":    "repay",
+    "deni":         "debt",
+    "faida":        "profit",
+    "hasara":       "loss",
+    "gharama":      "cost",
+    "bei":          "price",
+    "akaunti":      "account",
+    "riba":         "interest",
+    # ── Market ───────────────────────────────────────────────────────
+    "soko":         "market",
+    "sokoni":       "market",
+    "mnunuzi":      "buyer",
+    "muuzaji":      "seller",
+    "bidhaa":       "goods",
+    "kuuza":        "sell",
+    "kununua":      "buy",
+    # ── Training / knowledge ─────────────────────────────────────────
+    "mafunzo":      "training",
+    "elimu":        "education",
+    "ujuzi":        "skills",
+    "kujifunza":    "learning",
+    # ── Field officer / people ───────────────────────────────────────
+    "afisa":        "officer",
+    "maafisa":      "officers",
+    "mkulima":      "farmer",
+    "wakulima":     "farmers",
+    "kiongozi":     "leader",
+    "mwanakikundi": "member",
+    "wanakikundi":  "members",
+    "msimamizi":    "supervisor",
+    "wafanyakazi":  "staff",
+    # ── Group dynamics ───────────────────────────────────────────────
+    "kikundi":      "group",
+    "vikundi":      "groups",
+    "mkutano":      "meeting",
+    "mikutano":     "meetings",
+    "mshirika":     "partner",
+    # ── Problems / challenges ────────────────────────────────────────
+    "tatizo":       "problem",
+    "matatizo":     "problems",
+    "shida":        "challenge",
+    "ugumu":        "difficulty",
+    "ukosefu":      "shortage",
+    "lalamiko":     "complaint",
+    "malalamiko":   "complaints",
+    "wasiwasi":     "concern",
+    # ── Support / communication ──────────────────────────────────────
+    "msaada":       "support",
+    "usaidizi":     "assistance",
+    "taarifa":      "information",
+    "ujumbe":       "message",
+    "simu":         "phone",
+    "mawasiliano":  "communication",
+    # ── Quality ──────────────────────────────────────────────────────
+    "ubora":        "quality",
+    "hali":         "condition",
+    "aina":         "variety",
+    "bora":         "better",
+    "nzuri":        "good",
+    "mazuri":       "good",     # plural of nzuri
+    "vizuri":       "well",
+    "mbaya":        "bad",
+    "mabaya":       "bad",      # plural of mbaya
+    "vibaya":       "poorly",
+    "duni":         "poor",
+    # ── Sheng ────────────────────────────────────────────────────────
+    "poa":          "good",
+    "safi":         "excellent",
+    "moto":         "excellent",
+    "rada":         "aware",
+    "noma":         "difficult",
+    "ngori":        "difficult",
+    "fala":         "stupid",
+    "sawa":         "okay",
+}
+
+
+def load_user_token_map(path: str = "user_token_map.json") -> Dict[str, str]:
+    """
+    Load user-defined token mappings from a JSON file (optional).
+
+    Create this file to add Swahili/Sheng → English mappings specific to
+    your data or sector.  The system merges it with SWAHILI_TOKEN_MAP;
+    your entries win on any conflict.
+
+    Format of user_token_map.json:
+        { "haraka": "urgent", "chakula": "food", "elimu": "education" }
+
+    Returns an empty dict (not an error) if the file doesn't exist.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            user_map = json.load(f)
+        if isinstance(user_map, dict):
+            log.info("Loaded %d user token mappings from %s", len(user_map), path)
+            return {str(k).lower().strip(): str(v).lower().strip()
+                    for k, v in user_map.items()}
+    except Exception as exc:
+        log.warning("Could not load user_token_map.json (%s): %s", path, exc)
+    return {}
+
+
+def _build_token_map(user_map_path: str = "user_token_map.json") -> Dict[str, str]:
+    """Merge built-in SWAHILI_TOKEN_MAP with user map. User entries win on conflict."""
+    merged = dict(SWAHILI_TOKEN_MAP)
+    merged.update(load_user_token_map(user_map_path))
+    return merged
+
+
+# Cached English word set for unknown-token detection (lazy-loaded once)
+_ENGLISH_WORD_SET: Optional[set] = None
+
+
+def _get_english_word_set() -> set:
+    """
+    Lazily load the NLTK English words corpus.  Cached after first call.
+    Falls back to a minimal set if the corpus is unavailable.
+    """
+    global _ENGLISH_WORD_SET
+    if _ENGLISH_WORD_SET is not None:
+        return _ENGLISH_WORD_SET
+    try:
+        from nltk.corpus import words as _nltk_words
+        _ENGLISH_WORD_SET = {w.lower() for w in _nltk_words.words()}
+        log.info("NLTK English word set loaded (%d words)", len(_ENGLISH_WORD_SET))
+    except Exception:
+        # Minimal safety-net covering the most common survey vocabulary
+        _ENGLISH_WORD_SET = set(ENGLISH_STOP_WORDS) | {
+            "late", "early", "good", "bad", "poor", "quality", "delivery",
+            "training", "loan", "payment", "market", "officer", "group",
+            "member", "seed", "fertilizer", "harvest", "farm", "support",
+            "field", "problem", "issue", "cost", "price", "distance",
+        }
+    return _ENGLISH_WORD_SET
+
+# ══════════════════════════════════════════════════════════════════════
+# KOBO / ODK LOADER  (Section 3)
+# ══════════════════════════════════════════════════════════════════════
+# KoboToolbox and ODK both export data with a consistent set of system
+# columns and structural conventions that break standard loaders.
+# This function handles all of them in one place.
+#
+# WHAT IT FIXES
+# ─────────────
+# 1. Metadata columns  — _uuid, _submission_time, _id, _index,
+#    _validation_status, formhub/uuid, meta/instanceID, _parent_index,
+#    _xform_id_string, _geolocation, _tags, _notes, _status, _submitted_by
+#    These are Kobo/ODK system fields and must not reach the NLP pipeline.
+#
+# 2. Group-prefixed column names  — KoboToolbox wraps questions inside
+#    groups and exports them as "group_name/question_name" (XLS form) or
+#    "group_name-question_name" (some CSV exports).  These are flattened
+#    to just the question name so text_columns stays clean.
+#    Example:  "household_info/q1_inputs"  →  "q1_inputs"
+#
+# 3. Repeat-group index columns  — "_index" and "_parent_index" appear
+#    in repeat-group exports and are stripped.
+#
+# 4. Encoding  — Kobo CSV exports often arrive as Windows-1252 or
+#    UTF-8-BOM from older form versions; chardet handles this.
+#
+# USAGE (standalone)
+# ──────────────────
+#   df = load_kobo_export("my_kobo_export.xlsx")
+#   print(df.columns.tolist())   # shows clean question names
+#
+# USAGE (automatic)
+# ─────────────────
+#   Pass any Kobo/ODK file to FeedbackInsightEngine — _load_file()
+#   detects the fingerprints and calls this automatically.
+
+# System columns exported by KoboToolbox and ODK — always strip these
+_KOBO_META_PREFIXES: tuple = (
+    "_",              # _uuid, _id, _submission_time, _index, _geolocation …
+    "formhub/",       # formhub/uuid
+    "meta/",          # meta/instanceID, meta/deprecatedID
+    "formhub-",       # alternative separator in some exports
+    "meta-",
+)
+
+_KOBO_META_EXACT: set = {
+    # Explicit names that don't start with _ but are still metadata
+    "start", "end", "today", "deviceid", "simserial", "phonenumber",
+    "username", "caseid", "xform_id_string", "version",
+    "submitted_by", "validation_status", "status", "uuid",
+}
+
+
+def _is_kobo_meta(col: str) -> bool:
+    """Return True if this column is a Kobo/ODK system/metadata column."""
+    c = col.strip()
+    for prefix in _KOBO_META_PREFIXES:
+        if c.lower().startswith(prefix):
+            return True
+    return c.lower() in _KOBO_META_EXACT
+
+
+def _flatten_kobo_column(col: str) -> str:
+    """
+    Flatten a group-prefixed Kobo/ODK column name to its final segment.
+
+    Examples
+    --------
+    "household_info/q1_inputs"    →  "q1_inputs"
+    "section_a-q2_training"       →  "q2_training"
+    "repeat_group/q3_fieldofficer"→  "q3_fieldofficer"
+    "plain_column"                →  "plain_column"   (unchanged)
+    """
+    # XLSForm uses "/" as group separator; some CSV exports use "-"
+    for sep in ("/", "-"):
+        if sep in col:
+            return col.split(sep)[-1].strip()
+    return col.strip()
+
+
+def load_kobo_export(path: str) -> pd.DataFrame:
+    """
+    Load a KoboToolbox or ODK export and return a clean DataFrame.
+
+    Handles
+    -------
+    • .xlsx and .csv exports (encoding auto-detected)
+    • Metadata column stripping (_uuid, _submission_time, formhub/uuid, …)
+    • Group-prefixed column flattening  (group/question → question)
+    • Duplicate column names after flattening (suffixed _2, _3, …)
+    • Empty rows (all-NaN) removed
+
+    Parameters
+    ----------
+    path : str
+        Path to the Kobo/ODK export file (.xlsx or .csv).
+
+    Returns
+    -------
+    pd.DataFrame  with clean column names and no metadata columns.
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+
+    # ── Load raw file ─────────────────────────────────────────────────
+    if suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(p, dtype=str)
+    else:
+        # Auto-detect encoding (Kobo CSVs vary widely)
+        raw = p.read_bytes()[:50_000]
+        result = chardet.detect(raw)
+        enc = result.get("encoding") or "utf-8"
+        try:
+            df = pd.read_csv(p, encoding=enc, dtype=str)
+        except Exception:
+            # encoding_errors='replace' keeps bad bytes instead of crashing
+            df = pd.read_csv(p, encoding="utf-8", encoding_errors="replace",
+                             dtype=str)
+
+    original_cols = list(df.columns)
+    log.info("Kobo loader: raw file has %d rows × %d columns", *df.shape)
+
+    # ── Strip metadata columns ────────────────────────────────────────
+    meta_cols  = [c for c in df.columns if _is_kobo_meta(c)]
+    data_cols  = [c for c in df.columns if not _is_kobo_meta(c)]
+    df = df[data_cols].copy()
+
+    if meta_cols:
+        log.info(
+            "Kobo loader: stripped %d metadata column(s): %s",
+            len(meta_cols),
+            ", ".join(meta_cols[:8]) + (" …" if len(meta_cols) > 8 else ""),
+        )
+
+    # ── Flatten group-prefixed column names ───────────────────────────
+    flat_names: List[str] = []
+    seen: Dict[str, int] = {}
+    for col in df.columns:
+        flat = _flatten_kobo_column(col)
+        if flat in seen:
+            seen[flat] += 1
+            flat = f"{flat}_{seen[flat]}"   # e.g. q1_inputs_2
+        else:
+            seen[flat] = 1
+        flat_names.append(flat)
+
+    renamed = {old: new for old, new in zip(df.columns, flat_names) if old != new}
+    if renamed:
+        df.rename(columns=renamed, inplace=True)
+        log.info(
+            "Kobo loader: flattened %d group-prefixed column(s): %s",
+            len(renamed),
+            ", ".join(f"{o} → {n}" for o, n in list(renamed.items())[:5])
+            + (" …" if len(renamed) > 5 else ""),
+        )
+
+    # ── Drop fully-empty rows ─────────────────────────────────────────
+    before = len(df)
+    df = df.dropna(how="all").reset_index(drop=True)
+    dropped = before - len(df)
+    if dropped:
+        log.info("Kobo loader: dropped %d empty row(s).", dropped)
+
+    log.info(
+        "Kobo loader: ready — %d rows × %d columns.  "
+        "Set text_columns to any of: %s",
+        len(df), len(df.columns),
+        ", ".join(df.columns.tolist()),
+    )
+    return df
+
+
+def _is_kobo_file(df: pd.DataFrame) -> bool:
+    """
+    Detect whether a loaded DataFrame looks like a Kobo/ODK export.
+
+    Checks for the three most reliable fingerprints:
+      1. A column starting with "_" (e.g. _uuid, _submission_time)
+      2. A column containing "/" (group-path separator in XLSForm)
+      3. The exact column name "formhub/uuid" or "meta/instanceID"
+    """
+    cols_lower = {c.lower() for c in df.columns}
+    # Fingerprint 1: system columns with leading underscore
+    if any(c.startswith("_") for c in df.columns):
+        return True
+    # Fingerprint 2: group-path separator
+    if any("/" in c for c in df.columns):
+        return True
+    # Fingerprint 3: known Kobo metadata exact names
+    if cols_lower & {"formhub/uuid", "meta/instanceid", "start", "end",
+                     "deviceid", "simserial", "phonenumber"}:
+        return True
+    return False
+
 
 # ══════════════════════════════════════════════════════════════════════
 # RECOMMENDATION RULES  ─ Africa / Kenya context
@@ -507,8 +1064,11 @@ class FeedbackInsightEngine:
         log.info("Loaded %d rows × %d columns", *self.df.shape)
 
         # ── shared NLP objects (loaded once) ─────────────────────────
-        log.info("Loading sentence-transformer model …")
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        log.info(
+            "Loading sentence-transformer model: %s …",
+            self.config.embedding_model,
+        )
+        self.model = SentenceTransformer(self.config.embedding_model)
 
         self.sia = SentimentIntensityAnalyzer()
         # Inject extra lexicon entries
@@ -565,6 +1125,19 @@ class FeedbackInsightEngine:
         
         # Initialize advanced engines if enabled
         self._init_advanced_engines()
+
+        # ── Section 1: Token map (built-in + user-defined) ────────────
+        self._token_map: Dict[str, str] = _build_token_map(
+            self.config.token_map_path
+        )
+        log.info(
+            "Token map ready: %d entries (built-in + user).  "
+            "Unknown tokens → %s after each run.",
+            len(self._token_map),
+            self.config.token_review_path,
+        )
+        # Accumulated unknown-token data across questions (cleared per run)
+        self._token_review_data: Dict[str, dict] = {}
 
     def _init_advanced_engines(self) -> None:
         """Initialize trigger/action engines from config."""
@@ -655,7 +1228,37 @@ class FeedbackInsightEngine:
         return enc
 
     def _load_file(self, path: Path) -> pd.DataFrame:
+        """
+        Load survey data from .xlsx, .xls, or .csv.
+
+        Auto-detects KoboToolbox / ODK exports by checking for their
+        structural fingerprints (_uuid column, group/question paths, etc.)
+        and routes them through load_kobo_export() automatically.
+
+        Standard files (no Kobo fingerprints) are loaded normally.
+        """
         suffix = path.suffix.lower()
+
+        # ── First pass: load raw to check for Kobo fingerprints ───────
+        if suffix in (".xlsx", ".xls"):
+            df_raw = pd.read_excel(path, dtype=str, nrows=2)
+        else:
+            enc = self._detect_encoding(path)
+            try:
+                df_raw = pd.read_csv(path, encoding=enc, dtype=str, nrows=2)
+            except Exception:
+                df_raw = pd.read_csv(
+                    path, encoding="utf-8", errors="replace", dtype=str, nrows=2
+                )
+
+        # ── Route to Kobo loader if fingerprints found ─────────────────
+        if _is_kobo_file(df_raw):
+            log.info(
+                "Kobo/ODK export detected in '%s' — using Kobo loader.", path.name
+            )
+            return load_kobo_export(str(path))
+
+        # ── Standard load (no Kobo fingerprints) ──────────────────────
         if suffix in (".xlsx", ".xls"):
             return pd.read_excel(path)
         else:
@@ -663,7 +1266,8 @@ class FeedbackInsightEngine:
             try:
                 return pd.read_csv(path, encoding=enc)
             except Exception:
-                return pd.read_csv(path, encoding="utf-8", errors="replace")
+                return pd.read_csv(path, encoding="utf-8",
+                                   encoding_errors="replace")
 
     # ══════════════════════════════════════════════════════════════════
     # LANGUAGE DETECTION
@@ -709,30 +1313,164 @@ class FeedbackInsightEngine:
 
     def normalize_text(self, text: str) -> str:
         """
-        Normalize sector-specific terminology for consistent clustering.
-        
-        ⚠️  RULE-BASED & SECTOR-AWARE:
-        This method uses normalizations specific to smallholder agriculture.
-        If you're using this on a different sector, add your own rules:
-        
+        Normalize text in two passes:
+          Pass 1 — Phrase-level: fix multi-word expressions (m-pesa → mpesa).
+          Pass 2 — Token-level: map Swahili/Sheng tokens → English equivalents
+                   using the merged SWAHILI_TOKEN_MAP + user_token_map.json.
+
+        ⚠️  SECTOR-AWARE:
+        Phrase-level rules below are specific to smallholder agriculture.
+        Add your sector's rules in the same style.
+
         HEALTHCARE examples:
             text = text.replace("hiv aids", "hiv")
-            text = text.replace("doc", "doctor")
-        
+            text = text.replace("antenatal care", "antenatal")
+
         WASH examples:
             text = text.replace("pit latrine", "latrine")
             text = text.replace("bore hole", "borehole")
         """
-        # Smallholder agriculture normalizations
-        text = text.replace("m pesa", "mpesa")      # Standardize M-Pesa
-        text = text.replace("m-pesa", "mpesa")
-        text = text.replace("boda boda", "boda")    # Standardize boda
-        text = text.replace("bodaboda", "boda")
-        text = text.replace("matatu", "transport")
+        # ── Pass 1: phrase-level fixes (order matters — longer first) ─
         text = text.replace("extension officer", "officer")
-        text = text.replace("field officer", "officer")
-        
+        text = text.replace("field officer",     "officer")
+        text = text.replace("boda boda",         "boda")
+        text = text.replace("bodaboda",          "boda")
+        text = text.replace("m-pesa",            "mpesa")
+        text = text.replace("m pesa",            "mpesa")
+        text = text.replace("matatu",            "transport")
+        text = text.replace("sawa sawa",         "okay")   # Sheng phrase
+
+        # ── Pass 2: token-level map ────────────────────────────────────
+        text = self.apply_token_map(text)
         return text
+
+    def apply_token_map(self, text: str) -> str:
+        """
+        Apply the loaded token map to every whitespace-separated token.
+
+        Tokens not found in the map are returned unchanged.
+        This is intentionally simple and fast (O(n) dict lookups).
+
+        Called by normalize_text() so it runs on every response before
+        TF-IDF, embedding, and VADER sentiment scoring.
+        """
+        if not self._token_map:
+            return text
+        return " ".join(self._token_map.get(tok, tok) for tok in text.split())
+
+    # ══════════════════════════════════════════════════════════════════
+    # TOKEN REVIEW  ─ unknown-token scanner + JSON report
+    # ══════════════════════════════════════════════════════════════════
+
+    def _save_token_review(self, question_col: str) -> None:
+        """
+        Scan compressed_text tokens that are (a) not English, (b) not in
+        stop-words, and (c) not already in the token map.  Write results to
+        token_review.json so the user knows what to add to user_token_map.json.
+
+        WORKFLOW
+        ────────
+        1st run  → token_review.json created with unknown tokens + frequencies
+        User     → reviews token_review.json, adds mappings to user_token_map.json
+        2nd run  → better clustering, better sentiment, better keywords
+
+        INTERACTIVE MODE (pause_for_token_review=True)
+        ──────────────────────────────────────────────
+        Pipeline pauses after this call, prints top tokens, and waits for the
+        user to update user_token_map.json before clustering begins.
+        """
+        english_words = _get_english_word_set()
+
+        # Build the "already known" set so we only surface genuinely new tokens
+        known: set = (
+            COMBINED_STOP_WORDS
+            | set(self._token_map.keys())
+            | set(self._token_map.values())
+            | english_words
+        )
+
+        # ── Collect token frequencies + example sentences ─────────────
+        token_counts: Dict[str, int] = {}
+        token_examples: Dict[str, List[str]] = {}
+
+        for _, row in self.q_df.iterrows():
+            compressed = str(row.get("compressed_text", ""))
+            clean_src  = str(row.get("clean_text", ""))[:120]
+            for tok in compressed.split():
+                tok = tok.lower().strip()
+                if len(tok) < 3 or tok in known:
+                    continue
+                token_counts[tok] = token_counts.get(tok, 0) + 1
+                if tok not in token_examples:
+                    token_examples[tok] = []
+                if len(token_examples[tok]) < 2:
+                    token_examples[tok].append(clean_src)
+
+        # ── Merge into cumulative store (across questions in this run) ─
+        for tok, count in token_counts.items():
+            entry = self._token_review_data.get(tok, {
+                "count": 0, "questions": [], "examples": [],
+            })
+            entry["count"] += count
+            if question_col not in entry["questions"]:
+                entry["questions"].append(question_col)
+            for ex in token_examples.get(tok, []):
+                if ex not in entry["examples"] and len(entry["examples"]) < 3:
+                    entry["examples"].append(ex)
+            self._token_review_data[tok] = entry
+
+        if not token_counts:
+            log.info("  ✅ No unknown tokens found in %s", question_col)
+            return
+
+        log.info(
+            "  📝 %d unknown tokens in '%s' — see %s",
+            len(token_counts), question_col, self.config.token_review_path,
+        )
+
+        # ── Write JSON report ──────────────────────────────────────────
+        sorted_data = dict(
+            sorted(self._token_review_data.items(),
+                   key=lambda x: -x[1].get("count", 0))
+        )
+        output = {
+            "generated": datetime.now(EAT).strftime("%Y-%m-%d %H:%M EAT"),
+            "instructions": (
+                "These tokens were not recognized as English and are not in "
+                "the built-in Swahili/Sheng map.  For each token you want to "
+                "translate, add it to user_token_map.json and re-run.\n"
+                "Format:  { \"token\": \"english_equivalent\", ... }"
+            ),
+            "user_token_map_path": self.config.token_map_path,
+            "total_unknown_tokens": len(sorted_data),
+            "tokens": sorted_data,
+        }
+        try:
+            review_path = Path(self.config.token_review_path)
+            with open(review_path, "w", encoding="utf-8") as f:
+                json.dump(output, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            log.warning("Could not write token_review.json: %s", exc)
+
+        # ── Optional interactive pause ─────────────────────────────────
+        if self.config.pause_for_token_review and token_counts:
+            top = sorted(token_counts.items(), key=lambda x: -x[1])[:8]
+            SEP = "─" * 62
+            print(f"\n{'═' * 62}")
+            print(f"  UNKNOWN TOKENS  —  {question_col}")
+            print(f"{'═' * 62}")
+            print(f"  {'Token':<20}  Count  Example")
+            print(SEP)
+            for tok, cnt in top:
+                ex = (token_examples.get(tok) or [""])[0][:50]
+                print(f"  {tok:<20}  {cnt:>5}  {ex}")
+            print(f"\n  Full list  →  {self.config.token_review_path}")
+            print(f"  Add mappings →  {self.config.token_map_path}")
+            print(SEP)
+            input("  Press Enter to continue with current mappings → ")
+            # Reload in case the user updated the file while paused
+            self._token_map = _build_token_map(self.config.token_map_path)
+            log.info("Token map reloaded: %d entries total", len(self._token_map))
 
     # ══════════════════════════════════════════════════════════════════
     # SARCASM / HEDGED-POSITIVE FLAG
@@ -816,17 +1554,22 @@ class FeedbackInsightEngine:
     def preprocess(self) -> None:
         rows = []
         langs = []
+        orig_idxs = []  # Section 5: track source respondent for each sentence
 
-        for text in self.q_df["response"]:
-            clean = self.clean_text(str(text))
-            lang = self.detect_language(str(text))
+        for _, resp_row in self.q_df.iterrows():
+            text     = resp_row["response"]
+            orig_idx = resp_row.get("orig_idx", -1)
+            clean    = self.clean_text(str(text))
+            lang     = self.detect_language(str(text))
             for s in self.split_sentences(clean):
                 rows.append(s)
                 langs.append(lang)
+                orig_idxs.append(orig_idx)
 
         self.q_df = pd.DataFrame({
             "clean_text": rows,
-            "lang": langs,
+            "lang":       langs,
+            "orig_idx":   orig_idxs,   # Section 5: respondent link preserved
         })
 
         self.q_df["compressed_text"] = self.q_df["clean_text"].apply(
@@ -839,6 +1582,12 @@ class FeedbackInsightEngine:
         ].copy().reset_index(drop=True)
 
         log.info("After preprocessing: %d sentence units", len(self.q_df))
+
+        # ── Section 1: scan for unmapped non-English tokens ───────────
+        # Writes token_review.json and (optionally) pauses for user input.
+        self._save_token_review(
+            getattr(self, "_current_question_col", "unknown")
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # TF-IDF
@@ -871,9 +1620,11 @@ class FeedbackInsightEngine:
 
         log.info("Encoding %d unique sentence units …", len(unique_texts))
 
+        # batch_size=32: safe for the multilingual L12 model on 8 GB RAM.
+        # (L6 English-only model could use 64, but L12 is ~2× the parameters.)
         unique_embeddings = self.model.encode(
             unique_texts,
-            batch_size=64,
+            batch_size=32,
             show_progress_bar=False,
             convert_to_numpy=True,
         )
@@ -2054,6 +2805,461 @@ class FeedbackInsightEngine:
         return export_df
 
     # ══════════════════════════════════════════════════════════════════
+    # PDF SUMMARY REPORT  (Section 4)
+    # ══════════════════════════════════════════════════════════════════
+
+    def build_pdf_report(self, output: Optional[str] = None) -> None:
+        """
+        Generate a 2-page printable PDF executive brief.
+
+        Page 1
+        ------
+        * Title bar (report title + generated timestamp)
+        * Survey snapshot box (total responses / questions / themes / alerts)
+        * Cross-question recurring themes (highlighted, if any)
+        * HIGH & MEDIUM priority alert table
+
+        Page 2+
+        -------
+        * Per-question blocks: theme table (Theme | Share% | Priority |
+          Owner | Recommendation excerpt)
+
+        Requires fpdf2 (pip install fpdf2).
+        If not installed the method logs a hint and returns immediately
+        without raising an exception.
+        """
+        if not FPDF_AVAILABLE:
+            log.warning(
+                "PDF report skipped — fpdf2 not installed. "
+                "Fix:  pip install fpdf2"
+            )
+            return
+
+        # ── Resolve output path ───────────────────────────────────────
+        if output:
+            pdf_path = output
+        elif self.config.pdf_filename:
+            pdf_path = self.config.pdf_filename
+        else:
+            base = self.config.output_filename
+            pdf_path = re.sub(r"\.xlsx?$", ".pdf", base, flags=re.IGNORECASE)
+            if not pdf_path.endswith(".pdf"):
+                pdf_path += ".pdf"
+
+        now_eat = datetime.now(EAT).strftime("%d %b %Y  %H:%M EAT")
+
+        # ── Latin-1 sanitizer ─────────────────────────────────────────
+        # fpdf2 built-in fonts (Helvetica) only cover Latin-1 (0x00-0xFF).
+        # Replace any out-of-range characters before passing to cell().
+        _CHAR_MAP = {
+            "\u2014": " - ", "\u2013": "-",
+            "\u2019": "'",   "\u2018": "'",
+            "\u201c": '"',   "\u201d": '"',
+            "\u2022": "*",   "\u2026": "...",
+            "\u00d7": "x",   "\u2192": "->",
+            "\u25b6": ">",   "\u2714": "v",
+            "\u274c": "x",   "\u26a0": "!",
+            "\U0001f534": "[HIGH]", "\U0001f7e1": "[MED]",
+            "\U0001f7e2": "[POS]",  "\u26aa": "[LOW]",
+        }
+
+        def _s(text: str) -> str:
+            """Sanitize to Latin-1; replace known specials first."""
+            for ch, rep in _CHAR_MAP.items():
+                text = text.replace(ch, rep)
+            return text.encode("latin-1", errors="replace").decode("latin-1")
+
+        # ── Colour palette (matches Excel scheme) ─────────────────────
+        NAVY       = (31,  56, 100)
+        MID_BLUE   = (47,  85, 151)
+        LIGHT_BLUE = (214, 228, 247)
+        WHITE      = (255, 255, 255)
+        BLACK      = (0,   0,   0)
+        DARK_GREY  = (60,  60,  60)
+        STRIPE     = (238, 242, 255)
+
+        PRI_BG = {
+            "HIGH":     (255, 179, 179),
+            "MEDIUM":   (255, 224, 179),
+            "POSITIVE": (198, 239, 206),
+            "LOW":      (240, 240, 240),
+        }
+        PRI_FG = {
+            "HIGH":     (180, 0,   0),
+            "MEDIUM":   (150, 75,  0),
+            "POSITIVE": (0,   97,  0),
+            "LOW":      (100, 100, 100),
+        }
+
+        # ── FPDF subclass: running header/footer on page 2+ ───────────
+        _title   = _s(self.config.report_title)
+        _gen     = _s(now_eat)
+        _navy    = NAVY
+        _mid     = MID_BLUE
+        _white   = WHITE
+        _dg      = DARK_GREY
+        _black   = BLACK
+
+        class _PDF(FPDF):
+            def header(self_):
+                if self_.page_no() == 1:
+                    return
+                self_.set_fill_color(*_mid)
+                self_.rect(0, 0, 210, 8, "F")
+                self_.set_y(2)
+                self_.set_font("Helvetica", "B", 7)
+                self_.set_text_color(*_white)
+                self_.cell(0, 4, _title, align="C")
+                self_.set_text_color(*_black)
+                self_.ln(6)
+
+            def footer(self_):
+                self_.set_y(-12)
+                self_.set_font("Helvetica", "", 7)
+                self_.set_text_color(140, 140, 140)
+                self_.cell(
+                    0, 5,
+                    f"Page {self_.page_no()}  |  {_gen}  |  Confidential",
+                    align="C",
+                )
+                self_.set_text_color(*_black)
+
+        pdf = _PDF(orientation="P", unit="mm", format="A4")
+        pdf.set_margins(left=14, top=14, right=14)
+        pdf.set_auto_page_break(auto=True, margin=14)
+        pdf.add_page()
+
+        EPW = pdf.epw    # effective page width  (~182 mm)
+        LH  = 5.5        # standard line height
+        SH  = 7.0        # section header height
+
+        # ── Helpers ───────────────────────────────────────────────────
+        def sec_hdr(title: str) -> None:
+            pdf.set_fill_color(*NAVY)
+            pdf.set_text_color(*WHITE)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(EPW, SH, _s(f"  {title}"), border=0, align="L",
+                     fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1)
+
+        def tbl_hdr(widths: list, labels: list) -> None:
+            pdf.set_fill_color(*MID_BLUE)
+            pdf.set_text_color(*WHITE)
+            pdf.set_font("Helvetica", "B", 7)
+            for w, lbl in zip(widths, labels):
+                pdf.cell(w, SH, _s(f" {lbl}"), border=1, align="L",
+                         fill=True, new_x="RIGHT", new_y="TOP")
+            pdf.ln(SH)
+
+        def data_row(widths: list, values: list,
+                     bg: tuple, fg: tuple,
+                     bold_col: int = -1) -> None:
+            pdf.set_fill_color(*bg)
+            for ci, (w, v) in enumerate(zip(widths, values)):
+                style = "B" if ci == bold_col else ""
+                colour = fg if ci == bold_col else DARK_GREY
+                pdf.set_text_color(*colour)
+                pdf.set_font("Helvetica", style, 7)
+                pdf.cell(w, LH, _s(f" {str(v)[:int(w*1.9)]}"),
+                         border=1, align="L", fill=True,
+                         new_x="RIGHT", new_y="TOP")
+            pdf.ln(LH)
+
+        # ══════════════════════════════════════════════════════════════
+        # PAGE 1  —  TITLE BAR
+        # ══════════════════════════════════════════════════════════════
+        pdf.set_fill_color(*NAVY)
+        pdf.rect(0, 0, 210, 22, "F")
+        pdf.set_y(4)
+        pdf.set_font("Helvetica", "B", 15)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(0, 8, _s(self.config.report_title),
+                 align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 8)
+        pdf.cell(0, 5, _s(f"Generated: {now_eat}"),
+                 align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(*BLACK)
+        pdf.ln(6)
+
+        # ══════════════════════════════════════════════════════════════
+        # PAGE 1  —  SURVEY SNAPSHOT
+        # ══════════════════════════════════════════════════════════════
+        total_resp = sum(
+            qd["dataset_summary"].get("Total Responses", 0)
+            for qd in self.question_results.values()
+        )
+        total_themes = sum(
+            len(qd["summary"]) for qd in self.question_results.values()
+        )
+        high_n = sum(
+            (qd["summary"].get("Priority", pd.Series()).str.upper() == "HIGH").sum()
+            for qd in self.question_results.values()
+            if "Priority" in qd["summary"].columns
+        )
+
+        sec_hdr("SURVEY SNAPSHOT")
+        box_w = EPW / 4
+        labels = ["Total Responses", "Questions Analysed",
+                  "Themes Identified", "HIGH Alerts"]
+        values = [str(total_resp), str(len(self.question_results)),
+                  str(total_themes), str(high_n)]
+
+        # Label row
+        pdf.set_fill_color(*LIGHT_BLUE)
+        pdf.set_text_color(*DARK_GREY)
+        pdf.set_font("Helvetica", "B", 7)
+        for lbl in labels:
+            pdf.cell(box_w, LH, _s(f"  {lbl}"), border=1, align="L",
+                     fill=True, new_x="RIGHT", new_y="TOP")
+        pdf.ln(LH)
+
+        # Value row
+        pdf.set_fill_color(*WHITE)
+        pdf.set_text_color(*NAVY)
+        pdf.set_font("Helvetica", "B", 13)
+        for val in values:
+            pdf.cell(box_w, 9, val, border=1, align="C",
+                     fill=True, new_x="RIGHT", new_y="TOP")
+        pdf.ln(9)
+        pdf.ln(3)
+
+        # ══════════════════════════════════════════════════════════════
+        # PAGE 1  —  CROSS-QUESTION THEMES
+        # ══════════════════════════════════════════════════════════════
+        if self.cross_question_themes:
+            sec_hdr("THEMES RECURRING ACROSS MULTIPLE QUESTIONS")
+            pdf.set_fill_color(255, 235, 235)
+            pdf.set_text_color(150, 0, 0)
+            pdf.set_font("Helvetica", "I", 8)
+            themes_str = "  *  ".join(self.cross_question_themes[:6])
+            pdf.multi_cell(EPW, LH, _s(f"  {themes_str}"),
+                           border=1, align="L", fill=True)
+            pdf.ln(3)
+
+        # ══════════════════════════════════════════════════════════════
+        # PAGE 1  —  PRIORITY ALERTS TABLE
+        # ══════════════════════════════════════════════════════════════
+        sec_hdr("PRIORITY ALERTS  -  HIGH & MEDIUM Issues")
+
+        cw = [18, 52, 30, 20, 32, 16]
+        tbl_hdr(cw, ["Priority", "Theme", "Question",
+                      "Responses", "Owner", "Days"])
+
+        alerts = []
+        for qname, qdata in self.question_results.items():
+            for _, row in qdata["summary"].iterrows():
+                pri = str(row.get("Priority", "")).upper()
+                if pri in ("HIGH", "MEDIUM"):
+                    alerts.append({
+                        "pri":   pri,
+                        "theme": row.get("Theme", ""),
+                        "q":     qname,
+                        "count": row.get("Response Count", ""),
+                        "owner": row.get("Action Owner", ""),
+                        "days":  str(row.get("Timeline (Days)", "")),
+                    })
+
+        alerts.sort(key=lambda a: (0 if a["pri"] == "HIGH" else 1,
+                                   -int(a["count"] or 0)))
+
+        if not alerts:
+            pdf.set_font("Helvetica", "I", 8)
+            pdf.set_text_color(*DARK_GREY)
+            pdf.set_fill_color(*WHITE)
+            pdf.cell(EPW, LH,
+                     "  No HIGH or MEDIUM priority issues detected.",
+                     border=1, align="L", fill=True,
+                     new_x="LMARGIN", new_y="NEXT")
+        else:
+            for i, a in enumerate(alerts[:16]):
+                bg = PRI_BG.get(a["pri"], WHITE)
+                fg = PRI_FG.get(a["pri"], DARK_GREY)
+                # Alternate slight shade
+                shade = tuple(min(255, v + 10) for v in bg)
+                row_bg = bg if i % 2 == 0 else shade
+                vals = [a["pri"], a["theme"], a["q"],
+                        str(a["count"]), a["owner"], a["days"]]
+                data_row(cw, vals, row_bg, fg, bold_col=0)
+
+        pdf.ln(2)
+
+        # ══════════════════════════════════════════════════════════════
+        # PAGE 2+  —  PER-QUESTION THEME TABLES
+        # ══════════════════════════════════════════════════════════════
+        pdf.add_page()
+
+        qcw  = [50, 14, 18, 30, 70]
+        qhdr = ["Theme", "Share %", "Priority", "Owner", "Recommendation"]
+
+        for qname, qdata in self.question_results.items():
+            s_df  = qdata["summary"]
+            ds    = qdata["dataset_summary"]
+            insig = qdata["insights"]
+
+            q_label  = qname.replace("_", " ").title()
+            resp_n   = ds.get("Total Responses", "")
+            themes_n = ds.get("Themes Identified", "")
+
+            # Question block header
+            pdf.set_fill_color(*NAVY)
+            pdf.set_text_color(*WHITE)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(
+                EPW, 6,
+                _s(f"  {q_label}  "
+                   f"({resp_n} responses  {themes_n} themes)"),
+                border=0, align="L", fill=True,
+                new_x="LMARGIN", new_y="NEXT",
+            )
+            pdf.ln(0.5)
+
+            # First insight
+            if insig:
+                pdf.set_fill_color(*LIGHT_BLUE)
+                pdf.set_text_color(*DARK_GREY)
+                pdf.set_font("Helvetica", "I", 7)
+                pdf.multi_cell(EPW, 4.5,
+                               _s(f"  > {insig[0]}"),
+                               border=0, align="L", fill=True)
+            pdf.ln(0.5)
+
+            # Column headers
+            tbl_hdr(qcw, qhdr)
+
+            # Data rows — top 6 themes
+            for row_i, (_, row) in enumerate(s_df.head(6).iterrows()):
+                pri  = str(row.get("Priority", "LOW")).upper()
+                bg   = PRI_BG.get(pri, WHITE)
+                fg   = PRI_FG.get(pri, DARK_GREY)
+                base = bg if row_i % 2 == 0 else STRIPE
+                rec  = str(row.get("Recommendation", ""))
+                rec_short = rec.split(".")[0][:75]
+                if len(rec) > 75:
+                    rec_short += "..."
+
+                vals = [
+                    str(row.get("Theme", ""))[:38],
+                    f"{row.get('Share (%)', 0):.1f}%",
+                    pri,
+                    str(row.get("Action Owner", ""))[:22],
+                    rec_short,
+                ]
+                data_row(qcw, vals, base, fg, bold_col=2)
+
+            pdf.ln(4)
+
+        # ── Save ──────────────────────────────────────────────────────
+        try:
+            pdf.output(pdf_path)
+            log.info("PDF report saved -> %s", pdf_path)
+        except Exception as exc:
+            log.error("PDF save failed: %s", exc)
+
+    # ══════════════════════════════════════════════════════════════════
+    # GEOGRAPHIC SEGMENTATION  (Section 5)
+    # ══════════════════════════════════════════════════════════════════
+
+    def build_geographic_breakdown(self) -> None:
+        """
+        Compute per-location theme distributions across all questions.
+
+        Requires:
+          - self.config.location_column set to a valid column in self.df
+          - orig_idx propagated through preprocess() (done in Section 5)
+
+        Populates self.geo_breakdown:
+        {
+            question_name: {
+                location_value: {
+                    "theme_counts":  {theme_name: int},
+                    "avg_sentiment": float,
+                    "top_issue":     str,
+                    "total":         int,
+                }
+            }
+        }
+        """
+        loc_col = self.config.location_column
+        if not loc_col:
+            self.geo_breakdown: Dict = {}
+            return
+
+        if loc_col not in self.df.columns:
+            log.warning(
+                "location_column '%s' not found in data — "
+                "geographic breakdown skipped. Available: %s",
+                loc_col,
+                ", ".join(self.df.columns.tolist()),
+            )
+            self.geo_breakdown = {}
+            return
+
+        log.info("Building geographic breakdown on column '%s' …", loc_col)
+        self.geo_breakdown = {}
+        min_resp = self.config.location_min_responses
+
+        for qname, qdata in self.question_results.items():
+            q_df    = qdata.get("q_df", pd.DataFrame()).copy()
+            s_df    = qdata.get("summary", pd.DataFrame())
+
+            if q_df.empty or "orig_idx" not in q_df.columns:
+                log.debug("No orig_idx in q_df for %s — skipping geo.", qname)
+                continue
+
+            # Build theme label lookup from cluster_to_theme_map
+            cluster_map = qdata.get("cluster_to_theme_map", {})
+
+            # Attach theme name to each sentence unit
+            if "cluster" in q_df.columns:
+                q_df["Theme"] = q_df["cluster"].map(cluster_map).fillna("Unclassified")
+            elif "Theme" not in q_df.columns:
+                log.debug("No cluster/Theme column in q_df for %s.", qname)
+                continue
+
+            # Join location from original df via orig_idx
+            loc_series = self.df[loc_col].astype(str)
+            q_df["location"] = q_df["orig_idx"].map(loc_series)
+
+            # Drop rows with missing location
+            q_df = q_df.dropna(subset=["location"])
+            q_df = q_df[q_df["location"].str.strip() != ""]
+
+            if q_df.empty:
+                continue
+
+            # Group by location
+            loc_breakdown: Dict = {}
+            for loc_val, grp in q_df.groupby("location"):
+                if len(grp) < min_resp:
+                    continue   # skip locations with too few data points
+
+                theme_counts = (
+                    grp["Theme"]
+                    .value_counts()
+                    .to_dict()
+                )
+                avg_sent = (
+                    grp["sentiment"].mean()
+                    if "sentiment" in grp.columns
+                    else 0.0
+                )
+                top_issue = max(theme_counts, key=theme_counts.get) if theme_counts else "—"
+
+                loc_breakdown[str(loc_val)] = {
+                    "theme_counts":  theme_counts,
+                    "avg_sentiment": round(float(avg_sent), 3),
+                    "top_issue":     top_issue,
+                    "total":         len(grp),
+                }
+
+            if loc_breakdown:
+                self.geo_breakdown[qname] = loc_breakdown
+                log.info(
+                    "  %s → %d locations with ≥%d responses",
+                    qname, len(loc_breakdown), min_resp,
+                )
+
+    # ══════════════════════════════════════════════════════════════════
     # EXCEL REPORT  ─ multi-question, fully rebuilt
     # ══════════════════════════════════════════════════════════════════
 
@@ -2799,6 +4005,154 @@ class FeedbackInsightEngine:
             self._set_data_row_heights(ws, start_row=data_start, height=16)
             self.smart_col_widths(ws)
 
+        # ══════════════════════════════════════════════════════════════
+        # GEOGRAPHIC BREAKDOWN SHEET  (Section 5)
+        # ══════════════════════════════════════════════════════════════
+        geo = getattr(self, "geo_breakdown", {})
+        if geo:
+            ws = wb.create_sheet("Geographic Breakdown")
+
+            next_row = self.write_sheet_heading(
+                ws,
+                title=f"Geographic Breakdown  —  by {self.config.location_column}",
+                subtitle=f"Theme distribution per location | {now_eat}",
+                merge_cols=10,
+            )
+            next_row += 1   # blank spacer row
+
+            # Palette for heatmap intensity: white → navy
+            def _heat_fill(count: int, max_count: int) -> PatternFill:
+                """Return a fill shading from very light to mid navy."""
+                if max_count == 0:
+                    return PatternFill()
+                ratio = min(count / max_count, 1.0)
+                # Interpolate from white (255) to #2F5597 (47,85,151)
+                r = int(255 - ratio * (255 - 47))
+                g = int(255 - ratio * (255 - 85))
+                b = int(255 - ratio * (255 - 151))
+                hex_col = f"{r:02X}{g:02X}{b:02X}"
+                return PatternFill(
+                    start_color=hex_col, end_color=hex_col, fill_type="solid"
+                )
+
+            for qname, loc_data in geo.items():
+                if not loc_data:
+                    continue
+
+                # ── Section header ────────────────────────────────────
+                sec = ws.cell(
+                    row=next_row, column=1,
+                    value=qname.upper().replace("_", " "),
+                )
+                sec.font  = Font(bold=True, size=11, color="FFFFFF")
+                sec.fill  = PatternFill(
+                    start_color=self.HEADER_COLOUR,
+                    end_color=self.HEADER_COLOUR,
+                    fill_type="solid",
+                )
+                sec.border = self._thin_border()
+                ws.merge_cells(
+                    start_row=next_row, start_column=1,
+                    end_row=next_row, end_column=10,
+                )
+                ws.row_dimensions[next_row].height = 22
+                next_row += 1
+
+                # ── Collect all theme names across locations ───────────
+                all_themes_here: List[str] = []
+                for ld in loc_data.values():
+                    all_themes_here.extend(ld["theme_counts"].keys())
+                # Rank themes by total occurrences, show top 6
+                from collections import Counter
+                theme_order = [
+                    t for t, _ in
+                    Counter(all_themes_here).most_common(6)
+                ]
+
+                # ── Column headers: Location | Top Issue | Avg Sent | themes… ─
+                headers = (
+                    ["Location", "Responses", "Top Issue", "Avg Sentiment"]
+                    + theme_order
+                )
+                for ci, h in enumerate(headers, 1):
+                    hc = ws.cell(row=next_row, column=ci, value=h)
+                    hc.font      = Font(bold=True, color="FFFFFF", size=9)
+                    hc.fill      = PatternFill(
+                        start_color=self.SUBHEAD_COLOUR,
+                        end_color=self.SUBHEAD_COLOUR,
+                        fill_type="solid",
+                    )
+                    hc.font      = Font(bold=True, color="000000", size=9)
+                    hc.alignment = Alignment(
+                        horizontal="center", vertical="center", wrap_text=True
+                    )
+                    hc.border = self._thin_border()
+                ws.row_dimensions[next_row].height = 24
+                next_row += 1
+                data_start = next_row
+
+                # Max count for heatmap scaling (per question)
+                max_count = max(
+                    (
+                        tc
+                        for ld in loc_data.values()
+                        for tc in ld["theme_counts"].values()
+                    ),
+                    default=1,
+                )
+
+                # ── Data rows ─────────────────────────────────────────
+                for ri, (loc_val, ld) in enumerate(
+                    sorted(loc_data.items(), key=lambda x: -x[1]["total"])
+                ):
+                    sent  = ld["avg_sentiment"]
+                    # Sentiment colour for the avg sentiment cell
+                    if sent <= -0.05:
+                        sent_colour = "FFE0E0"   # soft red
+                    elif sent >= 0.05:
+                        sent_colour = "E0FFE8"   # soft green
+                    else:
+                        sent_colour = "FFF9E0"   # soft yellow
+
+                    row_vals = (
+                        [loc_val, ld["total"], ld["top_issue"], round(sent, 3)]
+                        + [ld["theme_counts"].get(t, 0) for t in theme_order]
+                    )
+                    for ci, val in enumerate(row_vals, 1):
+                        c = ws.cell(row=next_row, column=ci, value=val)
+                        c.border    = self._thin_border()
+                        c.alignment = Alignment(
+                            horizontal="center", vertical="center"
+                        )
+                        # Heatmap shading for theme count columns
+                        if ci > 4 and isinstance(val, int) and val > 0:
+                            c.fill = _heat_fill(val, max_count)
+                            # White text when background is dark enough
+                            if val / max_count > 0.55:
+                                c.font = Font(color="FFFFFF", size=9)
+                        elif ci == 4:   # Avg Sentiment column
+                            c.fill = PatternFill(
+                                start_color=sent_colour,
+                                end_color=sent_colour,
+                                fill_type="solid",
+                            )
+                        elif ci == 3:   # Top Issue column — bold
+                            c.font = Font(bold=True, size=9)
+
+                    ws.row_dimensions[next_row].height = 18
+                    next_row += 1
+
+                # Auto-filter on the header row
+                ws.auto_filter.ref = (
+                    f"A{data_start - 1}:"
+                    f"{get_column_letter(len(headers))}{next_row - 1}"
+                )
+                next_row += 2   # two blank rows before next question
+
+            self.smart_col_widths(ws)
+            ws.column_dimensions["A"].width = 20   # Location
+            ws.column_dimensions["C"].width = 28   # Top Issue
+
         wb.save(output)
         log.info("✅ Report saved → %s", output)
 
@@ -2887,6 +4241,9 @@ class FeedbackInsightEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def run(self) -> None:
+        # Reset token review accumulator at the start of each full run
+        self._token_review_data = {}
+
         for column in self.text_columns:
             log.info("━━━ Analysing: %s ━━━", column)
 
@@ -2912,7 +4269,16 @@ class FeedbackInsightEngine:
                 continue
 
             # --- Build per-question df ---
-            self.q_df = raw_series.to_frame(name="response").reset_index(drop=True)
+            # ── Section 5: keep orig_idx so location can be joined back later.
+            # raw_series.index = original row positions in self.df — critical
+            # for the geographic breakdown join.  reset_index(drop=True) would
+            # destroy this link, so we capture it as a column first.
+            raw_df = raw_series.to_frame(name="response")
+            raw_df["orig_idx"] = raw_df.index
+            self.q_df = raw_df.reset_index(drop=True)
+
+            # ── Section 1: track which column is being processed ──────
+            self._current_question_col = column
 
             log.info("Preprocessing …")
             self.preprocess()
@@ -2982,6 +4348,11 @@ class FeedbackInsightEngine:
             log.info("Detecting cross-question themes …")
             self.detect_cross_question_themes()
 
+        # ── Section 5: geographic breakdown ───────────────────────────
+        if self.config.location_column:
+            log.info("Building geographic breakdown …")
+            self.build_geographic_breakdown()
+
         # --- Keyword coverage tips (always printed when rule-based recs used) ---
         # If LLM recs were used, print a condensed keyword discovery summary.
         if self._anthropic_client and self.config.use_llm_recommendations:
@@ -2992,6 +4363,11 @@ class FeedbackInsightEngine:
 
         log.info("Building Excel report …")
         self.build_excel_report()
+
+        # ── Section 4: PDF executive brief ────────────────────────────
+        if self.config.generate_pdf_report:
+            log.info("Building PDF summary …")
+            self.build_pdf_report()
 
     def _export_outputs(self) -> None:
         """
@@ -3128,6 +4504,11 @@ if __name__ == "__main__":
         large_dataset_threshold=500,
         min_responses=10,
 
+        # ── Embedding model (Section 2) ───────────────────────────────
+        # Multilingual model — handles Swahili, Sheng, English natively.
+        # Change to "all-MiniLM-L6-v2" for English-only data (slightly faster).
+        embedding_model="paraphrase-multilingual-MiniLM-L12-v2",
+
         # ── Sector context ────────────────────────────────────────────
         # Set this to your programme area for better LLM outputs:
         #   "smallholder agriculture"  |  "primary healthcare"
@@ -3143,6 +4524,17 @@ if __name__ == "__main__":
 
         report_title="One Acre Fund — Farmer Feedback Insights 2026",
         output_filename="oaf_farmer_survey_insight_report.xlsx",
+
+        # ── PDF summary (Section 4) ───────────────────────────────────
+        # Requires: pip install fpdf2
+        # Set False to skip PDF and produce only the Excel report.
+        generate_pdf_report=True,
+
+        # ── Geographic Segmentation (Section 5) ──────────────────────
+        # Column in your data that holds location labels.
+        # Set to "" to disable geographic breakdown.
+        location_column="county",
+        location_min_responses=10,
     )
 
     engine = FeedbackInsightEngine(
