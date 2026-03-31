@@ -320,6 +320,19 @@ QUESTIONS = [
     "q5_suggestions",
 ]
 
+# ── Section 5: Kenyan counties where OAF operates ────────────────────
+# Weights reflect realistic farmer enrollment — Bungoma & Kakamega largest.
+OAF_COUNTIES = [
+    "Bungoma", "Kakamega", "Siaya", "Trans Nzoia",
+    "Vihiga", "Busia", "Nandi", "Kisumu",
+    "Homa Bay", "Migori", "Uasin Gishu", "Nyamira",
+]
+OAF_COUNTY_WEIGHTS = [
+    0.18, 0.16, 0.12, 0.10,
+    0.09, 0.08, 0.07, 0.07,
+    0.06, 0.04, 0.02, 0.01,
+]
+
 # Theme-to-question affinity — drives cross-question pattern detection
 QUESTION_THEME_AFFINITY = {
     "q1_inputs":      ["input_quality", "input_delivery", "market_access"],
@@ -411,6 +424,7 @@ def generate_dataset(
 
     for i in range(n):
         respondent_themes = random.sample(all_themes, random.randint(1, 3))
+        county = random.choices(OAF_COUNTIES, weights=OAF_COUNTY_WEIGHTS, k=1)[0]
 
         is_swahili     = i in swahili_idx
         is_code_switch = i in code_idx
@@ -420,7 +434,7 @@ def generate_dataset(
         is_kenya       = i in kenya_idx
         is_filler      = i in filler_idx
 
-        row = {"response_id": i + 1}
+        row = {"response_id": i + 1, "county": county}
 
         for q in QUESTIONS:
             # Loud minority: extreme language on loan and field officer questions
@@ -460,7 +474,8 @@ def generate_dataset(
     )
 
     print(f"\n✅  Dataset saved → {output}")
-    print(f"    Shape : {df.shape[0]} rows × {df.shape[1]} columns\n")
+    print(f"    Shape : {df.shape[0]} rows × {df.shape[1]} columns")
+    print(f"    Columns: {', '.join(df.columns.tolist())}\n")
     print("Respondent composition:")
     print(f"  Standard English        : {n_standard}")
     print(f"  Swahili (rural farmers) : {n_swahili}  ({n_swahili/n*100:.0f}%)")
@@ -506,4 +521,4 @@ def generate_dataset(
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    df = generate_dataset(n=500, output="oaf_farmer_survey_demo.xlsx")
+    df = generate_dataset(n=2500, output="oaf_farmer_survey_demo.xlsx")
