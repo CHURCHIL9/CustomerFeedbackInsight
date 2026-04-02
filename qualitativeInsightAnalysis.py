@@ -366,6 +366,16 @@ try:
 except ImportError:
     FPDF_AVAILABLE = False
 
+# ── Sentiment complaint-signal layer (Phase 1 accuracy upgrade) ───────
+try:
+    from sentiment_config import compute_complaint_adjustment
+    SENTIMENT_CONFIG_AVAILABLE = True
+except ImportError:
+    SENTIMENT_CONFIG_AVAILABLE = False
+    # Inline fallback so the pipeline never crashes if the file is missing
+    def compute_complaint_adjustment(text: str, lang: str = "en") -> float:  # type: ignore
+        return 0.0
+
 nltk.download("vader_lexicon", quiet=True)
 nltk.download("stopwords", quiet=True)
 nltk.download("words", quiet=True)          # used by token_review unknown-word detection
@@ -2266,37 +2276,39 @@ class FeedbackInsightEngine:
 
     def compute_sentiment(self) -> None:
         """
-        Compute sentiment scores using a BLENDED dual-pathway approach.
+        Compute sentiment scores using a THREE-PATHWAY blended approach.
 
         PATHWAY 1 — VADER (on normalized / token-mapped text):
           • Best for English sentences and Swahili words translated by the
             token map (e.g. "mbaya" → "bad" → VADER scores "bad").
           • Enhanced by: extra_sentiment_lexicon + SWAHILI_SENTIMENT_LEXICON
-            both injected into VADER's vocabulary in __init__.
-          • Hedged language (English + Swahili) detected and down-scored.
+            both injected into VADER\'s vocabulary in __init__.
 
         PATHWAY 2 — Swahili Lexicon (_compute_lexicon_score):
           • Operates on clean_text BEFORE token mapping.
-          • Catches Swahili/Sheng words that the token map left untranslated.
+          • Catches Swahili/Sheng words the token map left untranslated.
           • Handles negation (si, bila, hapana) and intensifiers (sana, kabisa).
-          • Example:  "kazi ni ngumu sana" — VADER sees noise (≈ 0.0),
-            lexicon scores "ngumu" (-0.5) + "sana" (+0.12) → ≈ -0.2 ✓
 
-        BLENDING FORMULA (language-weighted):
+        PATHWAY 3 — Complaint Signal Adjustment (sentiment_config.py):
+          • Detects structural complaint signals VADER cannot see:
+              - Contrastive conjunctions ("but", "however", "lakini")
+              - Unmet expectation phrases ("did not", "was supposed to")
+              - Complaint verbs/nouns ("delayed", "failed", "tatizo")
+              - Domain negative lexicon (agricultural & NGO programme words)
+              - Extended 8-token negation window (vs VADER\'s 3-token window)
+          • Returns a negative adjustment added BEFORE blending.
+          • Hedged-language detection is applied alongside this pathway.
+
+        BLENDING FORMULA (language-weighted, rebalanced for complaint data):
           ┌────────────────┬──────────────┬────────────────┐
           │ Detected lang  │  VADER wt.   │  Lexicon wt.   │
           ├────────────────┼──────────────┼────────────────┤
-          │ sw (Swahili)   │    50%       │     50%        │
-          │ other African  │    65%       │     35%        │
-          │ en (English)   │    85%       │     15%        │
+          │ sw (Swahili)   │    40%       │     60%        │
+          │ other African  │    55%       │     45%        │
+          │ en (English)   │    75%       │     25%        │
           └────────────────┴──────────────┴────────────────┘
-
-        WHY NOT 100% ONE OR THE OTHER?
-        ───────────────────────────────
-        • VADER alone: Swahili words not in the token map score 0 → false neutral
-        • Lexicon alone: English complex sentences, hedged phrasing, sarcasm
-          not well handled by a simple dict → misses nuance VADER catches
-        • Blended: each pathway compensates for the other's blind spots
+          VADER weight reduced: VADER drifts positive on unknown tokens.
+          The complaint layer + lexicon corrects for this bias.
         """
         lang_col = "lang" in self.q_df.columns
         texts = self.q_df["clean_text"].tolist()
@@ -2304,25 +2316,32 @@ class FeedbackInsightEngine:
 
         scores = []
         for text, lang in zip(texts, langs):
+            lang = str(lang).strip() if lang else "en"
+
             # ── Pathway 1: VADER on normalized text ──────────────────
-            base        = self.sia.polarity_scores(text)["compound"]
-            hedge_adj   = self.detect_hedged_sentiment(text)
-            vader_score = max(-1.0, min(1.0, base + hedge_adj))
+            base = self.sia.polarity_scores(text)["compound"]
+
+            # ── Pathway 3: Complaint signals + hedged language ────────
+            # compute_complaint_adjustment covers structural complaint
+            # signals, domain lexicon, and extended negation window.
+            # detect_hedged_sentiment covers polite deflections.
+            complaint_adj = compute_complaint_adjustment(text, lang)
+            hedge_adj     = self.detect_hedged_sentiment(text)
+            vader_score   = max(-1.0, min(1.0, base + complaint_adj + hedge_adj))
 
             # ── Pathway 2: Swahili lexicon on clean text ──────────────
             lex_score = self._compute_lexicon_score(text)
 
             # ── Language-weighted blend ───────────────────────────────
-            lang = str(lang).strip() if lang else "en"
+            # VADER weight reduced vs previous version — VADER
+            # systematically drifts positive on unknown tokens.
             if lang == "sw":
-                # Pure Swahili: trust lexicon equally with VADER
-                final = 0.50 * vader_score + 0.50 * lex_score
+                final = 0.40 * vader_score + 0.60 * lex_score
             elif lang in ("und", "af", "so", "yo", "ha", "ig", "am"):
-                # Other African languages / undetermined: lean on lexicon
-                final = 0.65 * vader_score + 0.35 * lex_score
+                final = 0.55 * vader_score + 0.45 * lex_score
             else:
                 # English (or unknown → safe default)
-                final = 0.85 * vader_score + 0.15 * lex_score
+                final = 0.75 * vader_score + 0.25 * lex_score
 
             scores.append(max(-1.0, min(1.0, final)))
 
@@ -5600,10 +5619,10 @@ if __name__ == "__main__":
         # OPTION C: No LLM (fully offline, rule-based)
         #   Set use_llm_naming=False, use_llm_recommendations=False.
         #
-        use_gemini=False,               # ← True for Google Colab / Gemini
+        use_gemini=True,               # ← True for Google Colab / Gemini
         gemini_model="gemini-2.0-flash",
-        use_llm_naming=False,           # meaningful theme names via LLM
-        use_llm_recommendations=False,  # sector-aware recommendations via LLM
+        use_llm_naming=True,           # meaningful theme names via LLM
+        use_llm_recommendations=True,  # sector-aware recommendations via LLM
 
         report_title="One Acre Fund — Farmer Feedback Insights 2026",
         output_filename="oaf_farmer_survey_insight_report.xlsx",
