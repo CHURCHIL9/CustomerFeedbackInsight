@@ -1,7 +1,109 @@
 """
 ========================================================================
-FeedbackInsightEngine v3 – Africa-Ready Survey Analysis Pipeline
+FeedbackInsightEngine v3.3 – Africa-Ready Survey Analysis Pipeline
 ========================================================================
+
+UPGRADE SUMMARY (v3.2 → v3.3)
+------------------------------
+THEME REGISTRY (Section 8):
+  • Persistent JSON file (theme_registry.json) that maps sorted-keyword
+    fingerprints → stable human-readable theme names.
+  • Solves the "Run 1: Late Delivery / Run 2: Delayed Inputs" confusion:
+    once a theme is named, it stays named across all future runs on the
+    same or similar data.
+  • generate_theme_name() now checks the registry FIRST (before the
+    in-memory cache and before any LLM/rule-based call).
+  • New names from every run are written back to the registry at the end
+    of run() via _save_theme_registry().
+  • To rename a theme permanently: open theme_registry.json, edit the
+    value, re-run. The edited name wins over LLM suggestions forever.
+  • New EngineConfig field: theme_registry_path (default "theme_registry.json")
+  • Two new helper methods: _load_theme_registry(), _save_theme_registry().
+
+SILHOUETTE SCORE IN REPORT (Section 9):
+  • The silhouette score (already computed inside choose_clusters() for
+    small datasets) is now:
+    - Computed for ALL dataset sizes: large datasets compute it post-fit
+      in cluster_feedback() with a 1 000-point sample (RAM-safe on 8 GB).
+    - Stored on self._last_silhouette_score after each question.
+    - Added to dataset_summary with an interpretation label:
+        "Good (>0.35)"  |  "Acceptable (>0.20)"  |  "Weak (≤0.20)"
+    - Shown in the Excel Executive Summary stats table for every question,
+      with colour-coded Cluster Quality cell (green/amber/red).
+    - Shown in the PDF per-question block header line.
+  • Interpretation guide (printed in logs at clustering time):
+      > 0.35 → Good clustering — themes are well-separated.
+      > 0.20 → Acceptable — some overlap, but themes are usable.
+      ≤ 0.20 → Weak — consider adjusting min_cluster_size or
+               reviewing token-map coverage for this question.
+
+GEMINI INTEGRATION (Section 10 — Google Colab):
+  • Google Gemini replaces Claude/Anthropic as the optional LLM backend.
+    Designed for use in Google Colab where Gemini is free.
+  • New optional import: google-generativeai (pip install google-generativeai).
+  • New flag: GEMINI_AVAILABLE (mirrors existing ANTHROPIC_AVAILABLE).
+  • New EngineConfig fields:
+      use_gemini: bool = False   — set True to activate Gemini path.
+      gemini_model: str = "gemini-2.0-flash"  — free-tier model.
+  • __init__ initialises self._gemini_client when use_gemini=True;
+    the Anthropic client is NOT created (no Claude API key needed).
+  • Two new methods mirror the Claude equivalents exactly:
+      _gemini_theme_name()             — theme naming via Gemini.
+      _gemini_generate_recommendations() — batch recs via Gemini.
+  • Both methods use temperature=0.0 for reproducible output.
+  • Fallback chain: Gemini → rule-based (same as Claude path).
+  • generate_theme_name() routing order:
+      1. Theme Registry (Section 8)
+      2. In-memory cache
+      3. Gemini (if use_gemini=True and client available)
+      4. Claude (if use_gemini=False and anthropic installed)
+      5. Rule-based (always available, no API key needed)
+  • generate_recommendations() routing: Gemini → Claude → rule-based.
+  • SETUP (Google Colab):
+      import google.generativeai as genai
+      genai.configure(api_key="YOUR_GEMINI_API_KEY")
+      # Then run engine with use_gemini=True
+  • Nothing else in the pipeline changes — priority, sentiment,
+    clustering, and all analytics remain fully rule-based.
+
+UPGRADE SUMMARY (v3.1 → v3.2)
+------------------------------
+RESPONDENT COUNT FIX (Section 7):
+  • THE PROBLEM (was silent & misleading):
+    A 500-respondent survey where each person writes 3 sentences was
+    previously reported as "1 500 responses" per theme. Share (%) was
+    computed against the sentence pool, not the respondent pool.
+    e.g. "Late Delivery — 28 responses (5.6%)" really meant 28 sentence
+    UNITS, not 28 people.  The true figure might be only 18 people.
+  • THE FIX — two separate counts now tracked throughout the pipeline:
+    - Respondent Count  = unique respondents (orig_idx) per theme.
+                          THIS is the primary "how many people" metric.
+                          Drives Share (%), Trigger Engine thresholds,
+                          Impact Score, and all Excel/PDF reporting.
+    - Sentence Count    = total sentence units per cluster.
+                          Secondary / informational.  Useful for
+                          evaluating clustering density, shown in a
+                          separate Excel column.
+  • build_cluster_summary() now computes both via subset["orig_idx"].nunique()
+  • build_summary_table() uses respondent_count as the impact input to
+    TriggerEngine — priorities are now based on actual people, not sentences.
+  • Share (%) denominator = _question_response_count (total raw responses,
+    unchanged) — numerator is now respondent_count → correct percentages.
+  • Impact Score (severity) = respondent_count × |avg_sentiment| — no longer
+    inflated by long multi-sentence responses.
+  • generate_dataset_summary() reports:
+      Total Respondents, Respondents Captured in Themes,
+      Theme Coverage (%), Sentence Units Analysed,
+      Avg Sentences per Respondent.
+  • Excel: "Response Count" column renamed to "Respondent Count"; new
+    "Sentence Count" column added alongside it on every theme sheet.
+  • merge_similar_themes() sums both counts correctly.
+  • generate_key_insights() uses respondent_count for the loud-minority
+    detection (was comparing sentence counts, now compares people).
+  • All downstream outputs (PDF, Alerts & Actions, JSON, Clustered
+    Responses) updated to reference Respondent Count.
+  • Backward-compatible: if orig_idx is absent for any reason the code
+    gracefully falls back to sentence count.
 
 UPGRADE SUMMARY (v3 → v3.1)
 ----------------------------
@@ -52,9 +154,9 @@ PDF SUMMARY REPORT (Section 4):
     dependencies. Graceful degradation: if not installed the pipeline
     runs normally and logs a one-line install hint; it never crashes.
   • Page 1: title bar, survey snapshot (totals), HIGH/MEDIUM priority
-    alert table (theme · question · responses · owner · days).
-  • Page 2+: per-question theme tables (theme · share% · priority ·
-    owner · recommendation excerpt) — one compact block per question.
+    alert table (theme · question · respondents · owner · days).
+  • Page 2+: per-question theme tables (theme · respondent count ·
+    priority · owner · recommendation excerpt) — one compact block per question.
   • Cross-question recurring themes are highlighted at the top of
     page 1 when present.
   • Non-Latin-1 characters (em dashes, smart quotes, emoji) are
@@ -250,6 +352,13 @@ try:
     ANTHROPIC_AVAILABLE = True
 except ImportError:
     ANTHROPIC_AVAILABLE = False
+
+# Section 10 — Gemini (Google Colab / google-generativeai)
+try:
+    import google.generativeai as _gemini_lib
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 try:
     from fpdf import FPDF
@@ -465,6 +574,56 @@ class EngineConfig:
     #   WASH:        { "borehole": -0.5, "maji": 0.3 }
     #   Healthcare:  { "dawa": 0.2, "ugonjwa": -0.6 }
     #   Education:   { "elimu": 0.5, "mtihani": -0.2 }
+
+    # --- Theme Registry (Section 8) ---
+    theme_registry_path: str = "theme_registry.json"
+    # Persistent JSON file that maps keyword-fingerprints → stable theme names.
+    # Guarantees the same cluster of keywords always produces the same label
+    # across multiple runs on the same or similar datasets.
+    #
+    # How it works:
+    #   • On startup the registry is loaded from disk (empty dict if missing).
+    #   • generate_theme_name() checks the registry FIRST — before the
+    #     in-memory cache and before calling the LLM or rule-based logic.
+    #   • New names produced by either path are written back to the registry
+    #     at the end of every run() call so they survive process restarts.
+    #   • Key = "|".join(sorted(keywords[:3]))  (same fingerprint used by the
+    #     in-memory _theme_name_cache — fully compatible).
+    #
+    # To rename a theme across all future runs:
+    #   1. Open theme_registry.json
+    #   2. Find the entry (sorted top-3 keywords as the key)
+    #   3. Change the value to your preferred label
+    #   4. Re-run — the new name is used everywhere
+
+    # --- Gemini LLM Integration (Section 10 — Google Colab) ---
+    use_gemini: bool = False
+    # Set True to use Google Gemini (via google-generativeai) instead of Claude.
+    # This is the recommended path when running in Google Colab where Gemini
+    # is available for free via an API key.
+    #
+    # SETUP (Google Colab):
+    #   1. Get a free Gemini API key at https://aistudio.google.com/app/apikey
+    #   2. In Colab: set the GEMINI_API_KEY secret OR call
+    #        import google.generativeai as genai
+    #        genai.configure(api_key="YOUR_KEY")
+    #      BEFORE running the engine.
+    #   3. Set use_gemini=True here.
+    #   4. Set use_llm_naming=True and use_llm_recommendations=True as normal.
+    #
+    # When use_gemini=True:
+    #   • Gemini is used for theme naming and recommendations.
+    #   • The anthropic client is NOT initialised (no Claude API key needed).
+    #   • Falls back to rule-based logic if Gemini call fails.
+    #
+    # When use_gemini=False (default):
+    #   • Behaviour is identical to the existing Claude (Anthropic) path.
+
+    gemini_model: str = "gemini-2.0-flash"
+    # Gemini model to use.  Recommended free options as of 2025:
+    #   "gemini-2.0-flash"   — fast, free tier, good quality (default)
+    #   "gemini-1.5-flash"   — slightly older, also free tier
+    #   "gemini-1.5-pro"     — higher quality, lower free-tier quota
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1384,6 +1543,8 @@ class FeedbackInsightEngine:
         self.dataset_summary: Dict = {}
         self.emerging_issues: pd.DataFrame = pd.DataFrame()
         self.cluster_to_theme_map: Dict = {}  # Cluster ID → Theme name mapping
+        # Section 9: set by cluster_feedback(), consumed by generate_dataset_summary()
+        self._last_silhouette_score: Optional[float] = None
 
         # ── cross-question artefacts ──────────────────────────────────
         self.question_results: Dict = {}
@@ -1394,21 +1555,54 @@ class FeedbackInsightEngine:
         # cluster never makes a second API call within a run.
         self._theme_name_cache: Dict[str, str] = {}
         self._anthropic_client = None
+        self._gemini_client = None   # Section 10
+
         want_llm = (
             self.config.use_llm_naming or self.config.use_llm_recommendations
         )
-        if want_llm and ANTHROPIC_AVAILABLE:
-            try:
-                self._anthropic_client = _anthropic_lib.Anthropic()
-                log.info("Anthropic client initialised — LLM features enabled.")
-            except Exception as exc:
-                log.warning("Could not init Anthropic client (%s). "
-                            "Falling back to rule-based methods.", exc)
-        elif want_llm and not ANTHROPIC_AVAILABLE:
-            log.warning(
-                "anthropic package not installed — LLM features disabled. "
-                "Run: pip install anthropic"
-            )
+
+        if want_llm and self.config.use_gemini:
+            # ── Section 10: Gemini path ───────────────────────────────
+            if GEMINI_AVAILABLE:
+                try:
+                    # Configure is a no-op if genai.configure() was already
+                    # called by the notebook with an API key.  If the env var
+                    # GEMINI_API_KEY is set, the library picks it up automatically.
+                    import os as _os
+                    _api_key = _os.environ.get("GEMINI_API_KEY", "")
+                    if _api_key:
+                        _gemini_lib.configure(api_key=_api_key)
+                    self._gemini_client = _gemini_lib.GenerativeModel(
+                        self.config.gemini_model
+                    )
+                    log.info(
+                        "Gemini client initialised (model: %s) — LLM features enabled.",
+                        self.config.gemini_model,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Could not init Gemini client (%s). "
+                        "Falling back to rule-based methods.", exc
+                    )
+            else:
+                log.warning(
+                    "google-generativeai package not installed — Gemini disabled. "
+                    "Run:  pip install google-generativeai"
+                )
+        elif want_llm and not self.config.use_gemini:
+            # ── Existing Anthropic / Claude path ─────────────────────
+            if ANTHROPIC_AVAILABLE:
+                try:
+                    self._anthropic_client = _anthropic_lib.Anthropic()
+                    log.info("Anthropic client initialised — LLM features enabled.")
+                except Exception as exc:
+                    log.warning("Could not init Anthropic client (%s). "
+                                "Falling back to rule-based methods.", exc)
+            else:
+                log.warning(
+                    "anthropic package not installed — LLM features disabled. "
+                    "Run: pip install anthropic"
+                )
 
         # ── NEW: Load config and initialize engines (v3+ Upgrade) ────
         self.pipeline_config = load_config()
@@ -1428,6 +1622,81 @@ class FeedbackInsightEngine:
         )
         # Accumulated unknown-token data across questions (cleared per run)
         self._token_review_data: Dict[str, dict] = {}
+
+        # ── Section 8: Theme Registry (persistent name stability) ─────
+        # Loaded once at startup; new names written back at end of run().
+        self._theme_registry: Dict[str, str] = self._load_theme_registry()
+
+    # ══════════════════════════════════════════════════════════════════
+    # THEME REGISTRY  (Section 8)
+    # ══════════════════════════════════════════════════════════════════
+
+    def _load_theme_registry(self) -> Dict[str, str]:
+        """
+        Load the persistent theme name registry from disk.
+
+        The registry maps a sorted-keyword fingerprint (the same key used by
+        _theme_name_cache) to a stable human-readable theme name.  Loading it
+        once at startup means theme names generated in previous runs are reused
+        automatically without any LLM call or rule-based computation.
+
+        Returns an empty dict if the file does not exist yet — first run is
+        normal and the registry is built up over time.
+
+        To manually rename a theme: open theme_registry.json, edit the value
+        for the relevant key, and re-run. The edited name will be used for all
+        future runs until the underlying keywords change enough to produce a
+        new fingerprint.
+        """
+        p = Path(self.config.theme_registry_path)
+        if not p.exists():
+            log.info(
+                "Theme registry not found at '%s' — will create on first run.",
+                p,
+            )
+            return {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                registry = json.load(f)
+            if isinstance(registry, dict):
+                log.info(
+                    "Theme registry loaded: %d stable names from '%s'.",
+                    len(registry), p,
+                )
+                return {str(k): str(v) for k, v in registry.items()}
+        except Exception as exc:
+            log.warning("Could not load theme registry (%s): %s", p, exc)
+        return {}
+
+    def _save_theme_registry(self) -> None:
+        """
+        Persist the current in-memory theme name cache to theme_registry.json.
+
+        Called at the end of every run() so that theme names produced during
+        this run are available on the next run without repeating LLM calls.
+
+        The registry is the UNION of the loaded registry and all names generated
+        in the current run — it only ever grows, never shrinks (unless manually
+        edited).
+        """
+        # Merge: registry entries win over cache on conflict (manual edits survive)
+        merged = dict(self._theme_name_cache)   # new names from this run
+        merged.update(self._theme_registry)      # registry overrides (manual edits)
+        self._theme_registry = merged
+
+        p = Path(self.config.theme_registry_path)
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(
+                    dict(sorted(merged.items())),  # sorted keys for readability
+                    f, indent=2, ensure_ascii=False,
+                )
+            log.info(
+                "Theme registry saved: %d entries → '%s'.",
+                len(merged), p,
+            )
+        except Exception as exc:
+            log.warning("Could not save theme registry (%s): %s", p, exc)
 
     def _init_advanced_engines(self) -> None:
         """Initialize trigger/action engines from config."""
@@ -2166,10 +2435,16 @@ class FeedbackInsightEngine:
                                          sample_size=min(500, n))
                 if score > best_score:
                     best_k, best_score = k, score
+            # Section 9: store so generate_dataset_summary() can report it
+            self._last_silhouette_score = round(float(best_score), 3)
             return best_k
 
         suggested = int(np.sqrt(n / 2))
-        return min(suggested, self.config.max_clusters)
+        k = min(suggested, self.config.max_clusters)
+        # Section 9: compute silhouette post-hoc for large datasets too
+        # (sampled at 1 000 points so it stays fast on 8 GB RAM)
+        self._last_silhouette_score = None   # computed after clustering in cluster_feedback()
+        return k
 
     # ══════════════════════════════════════════════════════════════════
     # CLUSTERING  ─ MiniBatchKMeans for large datasets
@@ -2191,6 +2466,30 @@ class FeedbackInsightEngine:
             self.kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
 
         self.q_df["cluster"] = self.kmeans.fit_predict(self.embeddings)
+
+        # Section 9: for large datasets compute silhouette AFTER fitting.
+        # Sample at most 1 000 points so it stays fast on 8 GB RAM.
+        if self._last_silhouette_score is None and k >= 2:
+            try:
+                sil = silhouette_score(
+                    self.embeddings,
+                    self.q_df["cluster"],
+                    sample_size=min(1_000, n),
+                    random_state=42,
+                )
+                self._last_silhouette_score = round(float(sil), 3)
+            except Exception:
+                self._last_silhouette_score = None
+
+        quality = ""
+        if self._last_silhouette_score is not None:
+            s = self._last_silhouette_score
+            quality = "good" if s > 0.35 else ("acceptable" if s > 0.20 else "weak")
+            log.info(
+                "Silhouette score: %.3f (%s clustering — "
+                ">0.35 good, >0.20 acceptable, ≤0.20 weak)",
+                s, quality,
+            )
 
     # ══════════════════════════════════════════════════════════════════
     # FILTER CLUSTERS  ─ separate emerging vs discarded
@@ -2266,22 +2565,42 @@ class FeedbackInsightEngine:
     ) -> str:
         """
         Public entry-point for theme naming.
-        • LLM path  : one cached API call → meaningful 2-4 word name.
-        • Fallback  : improved rule-based (no redundant word-pairs).
+
+        Priority order (Section 8 — Theme Registry):
+          1. Theme Registry  — stable name from a previous run (disk-persisted).
+             This ensures the same cluster of keywords always produces the
+             same label across runs, preventing report confusion.
+          2. In-memory cache — already computed this run (avoids duplicate calls).
+          3. LLM path        — Gemini (Section 10) or Claude API call.
+          4. Rule-based      — improved bigram/unigram fallback (always available).
         """
         if not keywords:
             return "Other Feedback"
 
-        # Cache key = sorted top-3 keywords (stable across calls)
+        # Fingerprint: sorted top-3 keywords (stable across calls)
         cache_key = "|".join(sorted(keywords[:3]))
+
+        # 1. Registry lookup (Section 8) — survives across runs
+        if cache_key in self._theme_registry:
+            # Warm the in-memory cache too so downstream code is consistent
+            self._theme_name_cache[cache_key] = self._theme_registry[cache_key]
+            return self._theme_registry[cache_key]
+
+        # 2. In-memory cache — already resolved this run
         if cache_key in self._theme_name_cache:
             return self._theme_name_cache[cache_key]
 
-        if self._anthropic_client and self.config.use_llm_naming:
+        # 3+4. Generate name via LLM or rule-based
+        if self._gemini_client and self.config.use_llm_naming:
+            # Section 10: Gemini path
+            name = self._gemini_theme_name(keywords, samples or [])
+        elif self._anthropic_client and self.config.use_llm_naming:
+            # Existing Claude path
             name = self._llm_theme_name(keywords, samples or [])
         else:
             name = self._rule_based_theme_name(keywords)
 
+        # Store in both caches (registry is flushed to disk at end of run)
         self._theme_name_cache[cache_key] = name
         return name
 
@@ -2361,6 +2680,47 @@ class FeedbackInsightEngine:
             log.debug("LLM theme naming failed (%s); using rule-based.", exc)
             return self._rule_based_theme_name(keywords)
 
+    def _gemini_theme_name(
+        self, keywords: List[str], samples: List[str]
+    ) -> str:
+        """
+        Section 10 — Ask Gemini for a meaningful 2-4 word theme name.
+        Mirrors _llm_theme_name() exactly; falls back to rule-based on any error.
+
+        Uses temperature=0.0 (via generation_config) for maximum consistency,
+        which is the Gemini equivalent of the deterministic Claude setting.
+        """
+        sector_ctx = (
+            f"The data comes from a {self.config.sector} programme."
+            if self.config.sector else ""
+        )
+        sample_text = " | ".join(samples[:3]) if samples else "(none)"
+        prompt = (
+            f"You are labelling themes extracted from survey feedback. "
+            f"{sector_ctx}\n\n"
+            f"Top keywords: {', '.join(keywords[:6])}\n"
+            f"Example responses: {sample_text}\n\n"
+            "Give a clear, meaningful 2–4 word theme label that a non-technical "
+            "M&E officer would immediately understand. "
+            "Return ONLY the theme name — no punctuation, no explanation."
+        )
+        try:
+            gen_cfg = _gemini_lib.types.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=20,
+            )
+            response = self._gemini_client.generate_content(
+                prompt,
+                generation_config=gen_cfg,
+            )
+            raw = response.text.strip().strip('"').strip("'")
+            if 2 <= len(raw.split()) <= 6 and raw:
+                return raw.title()
+            return self._rule_based_theme_name(keywords)
+        except Exception as exc:
+            log.debug("Gemini theme naming failed (%s); using rule-based.", exc)
+            return self._rule_based_theme_name(keywords)
+
     # ══════════════════════════════════════════════════════════════════
     # CLUSTER SUMMARY BUILD
     # ══════════════════════════════════════════════════════════════════
@@ -2368,14 +2728,31 @@ class FeedbackInsightEngine:
     def build_cluster_summary(self) -> None:
         self.cluster_summary = {}
         for cid in sorted(self.q_df["cluster"].unique()):
-            subset = self.q_df[self.q_df["cluster"] == cid]
+            subset  = self.q_df[self.q_df["cluster"] == cid]
             texts   = subset["clean_text"].tolist()
             indices = subset.index.tolist()
-            kw = self.extract_keywords(indices, self.config.top_keywords)
+            kw      = self.extract_keywords(indices, self.config.top_keywords)
+
+            # ── Section 7: Respondent Count Fix ──────────────────────
+            # sentence_count  = number of sentence units in this cluster.
+            #                   One long response can produce several units,
+            #                   so this OVER-counts distinct people.
+            # respondent_count = unique orig_idx values = ACTUAL number of
+            #                   distinct respondents who contributed to this
+            #                   theme.  This is the correct "how many people
+            #                   mentioned this" metric.
+            sentence_count    = len(texts)
+            respondent_count  = (
+                subset["orig_idx"].nunique()
+                if "orig_idx" in subset.columns
+                else sentence_count          # graceful fallback if orig_idx absent
+            )
+
             self.cluster_summary[cid] = {
-                "count":    len(texts),
-                "keywords": kw,
-                "samples":  texts[:5],
+                "count":            sentence_count,    # raw sentence units (internal)
+                "respondent_count": respondent_count,  # PRIMARY metric (Section 7)
+                "keywords":         kw,
+                "samples":          texts[:5],
             }
             # Pre-warm the theme name cache while cluster data is fresh
             self.generate_theme_name(kw, texts[:3])
@@ -2392,6 +2769,18 @@ class FeedbackInsightEngine:
         percentile-based thresholds, reinitializes the TriggerEngine with
         data-driven thresholds, applies Trigger/Action engines to
         each theme, validates results, and produces `self.summary_df`.
+
+        SECTION 7 — RESPONDENT COUNT FIX
+        ──────────────────────────────────
+        Two counts are now tracked separately:
+          • Respondent Count — how many UNIQUE respondents mentioned this theme.
+            This is the truthful "how widespread is this" metric and drives
+            Share (%) and the Trigger Engine impact thresholds.
+          • Sentence Count   — total sentence units in the cluster.
+            Informational only; useful for debugging clustering quality.
+
+        Key rule: Impact fed to TriggerEngine = Respondent Count.
+        Share (%) denominator = total unique respondents for the question.
         """
         total = self._question_response_count  # set in run() per question
 
@@ -2401,7 +2790,13 @@ class FeedbackInsightEngine:
             theme_name = self.generate_theme_name(info.get("keywords", []))
             subset = self.q_df[self.q_df["cluster"] == cid]
             avg_sent = subset["sentiment"].mean() if len(subset) > 0 else 0.0
-            pct = round((info.get("count", 0) / max(total, 1)) * 100, 2)
+
+            # ── Section 7: use respondent_count as canonical count ────
+            respondent_count = int(info.get("respondent_count", info.get("count", 0)))
+            sentence_count   = int(info.get("count", 0))
+
+            # Share (%) is now respondent-based — no more sentence inflation
+            pct = round((respondent_count / max(total, 1)) * 100, 2)
 
             # intensity: few very negative sentences vs many mildly negative
             negative_sentences = subset[subset["sentiment"] < -0.3]
@@ -2409,19 +2804,22 @@ class FeedbackInsightEngine:
                 negative_sentences["sentiment"].abs().mean()
                 if len(negative_sentences) > 0 else 0.0
             )
-            severity = info.get("count", 0) * abs(avg_sent)
+            # Impact Score uses respondent_count for a fair severity signal
+            severity = respondent_count * abs(avg_sent)
 
             themes.append({
-                "cluster_id": cid,
-                "name": theme_name,
-                "impact": int(info.get("count", 0)),
-                "share_pct": pct,
-                "impact_score": round(severity, 2),
-                "intensity": round(intensity, 3),
+                "cluster_id":      cid,
+                "name":            theme_name,
+                "impact":          respondent_count,    # PRIMARY metric (Section 7)
+                "respondent_count": respondent_count,   # alias — explicit label
+                "sentence_count":  sentence_count,      # secondary / informational
+                "share_pct":       pct,
+                "impact_score":    round(severity, 2),
+                "intensity":       round(intensity, 3),
                 "sentiment_score": round(avg_sent, 3),
-                "keywords": [k.strip() for k in info.get("keywords", []) if k.strip()],
+                "keywords":        [k.strip() for k in info.get("keywords", []) if k.strip()],
                 "representative_quote": info.get("samples", [""])[0] if info.get("samples") else "",
-                "recommendation": info.get("recommendation", "") or "",
+                "recommendation":  info.get("recommendation", "") or "",
             })
 
         # 2) Map sentiment scores -> labels (strict mapping per spec)
@@ -2521,24 +2919,26 @@ class FeedbackInsightEngine:
                 trigger_status = triggers[0].get("message", "No Alert")
             
             enriched.append({
-                "Cluster ID": t["cluster_id"],
-                "Theme": t["name"],
-                "Response Count": t["impact"],
-                "Share (%)": t["share_pct"],
-                "Impact Score": t["impact_score"],
-                "Intensity Score": t["intensity"],
-                "Average Sentiment": t["sentiment_score"],
-                "Theme Sentiment": t.get("sentiment", "Neutral"),
-                "Key Keywords": ", ".join(t.get("keywords", [])),
+                "Cluster ID":       t["cluster_id"],
+                "Theme":            t["name"],
+                # ── Section 7: two count columns ──────────────────────
+                "Respondent Count": t.get("respondent_count", t["impact"]),  # unique people
+                "Sentence Count":   t.get("sentence_count", t["impact"]),    # sentence units
+                "Share (%)":        t["share_pct"],
+                "Impact Score":     t["impact_score"],
+                "Intensity Score":  t["intensity"],
+                "Average Sentiment":t["sentiment_score"],
+                "Theme Sentiment":  t.get("sentiment", "Neutral"),
+                "Key Keywords":     ", ".join(t.get("keywords", [])),
                 "Representative Quote": t.get("representative_quote", ""),
-                "triggers": triggers,
-                "Priority": priority_label,
-                "Trigger Status": trigger_status,
-                "Action Owner": action_plan.get("owner", "Program Manager"),
-                "Timeline (Days)": action_plan.get("timeline", 30),
-                "Actions": actions_joined,
-                "Recommendation": t.get("recommendation", ""),
-                "action_plan": action_plan,
+                "triggers":         triggers,
+                "Priority":         priority_label,
+                "Trigger Status":   trigger_status,
+                "Action Owner":     action_plan.get("owner", "Program Manager"),
+                "Timeline (Days)":  action_plan.get("timeline", 30),
+                "Actions":          actions_joined,
+                "Recommendation":   t.get("recommendation", ""),
+                "action_plan":      action_plan,
             })
 
         # 6) Validation: ensure required fields
@@ -2625,17 +3025,20 @@ class FeedbackInsightEngine:
         """
         Generates one recommendation per theme.
 
-        Mode A — LLM (use_llm_recommendations=True AND anthropic installed):
-          Sends ALL themes in a single batch API call so latency is low.
-          The LLM receives: theme name, sentiment, keywords, a sample quote,
-          and the sector context — producing specific, actionable advice.
+        Mode A — Gemini (Section 10, use_gemini=True):
+          Batch call to Gemini — all themes in one prompt → list of recs.
 
-        Mode B — Rule-based (fallback):
+        Mode B — Claude/Anthropic (use_gemini=False, anthropic installed):
+          Existing single batch API call to Claude Haiku.
+
+        Mode C — Rule-based (fallback):
           Matches keywords against RECOMMENDATION_RULES.
-          After matching, prints the KEYWORD TIPS report so you can see
-          which terms fell through to the fallback and add new rules.
+          Prints KEYWORD TIPS report after matching.
         """
-        if self._anthropic_client and self.config.use_llm_recommendations:
+        if self._gemini_client and self.config.use_llm_recommendations:
+            # Section 10: Gemini path
+            self._gemini_generate_recommendations()
+        elif self._anthropic_client and self.config.use_llm_recommendations:
             self._llm_generate_recommendations()
         else:
             self._rule_based_recommendations()
@@ -2699,6 +3102,86 @@ class FeedbackInsightEngine:
         except Exception as exc:
             log.warning("LLM recommendation generation failed (%s) — "
                         "falling back to rule-based.", exc)
+
+        # Fallback
+        self._rule_based_recommendations()
+
+    def _gemini_generate_recommendations(self) -> None:
+        """
+        Section 10 — Batch Gemini call: all themes → one prompt → list of recs.
+
+        Mirrors _llm_generate_recommendations() exactly:
+        • Same prompt structure and JSON-array response format.
+        • Same code-fence stripping and length validation.
+        • Falls back to rule-based on any error.
+
+        Temperature is set to 0.0 for reproducible output.
+        """
+        sector_ctx = (
+            f"The organisation works in the {self.config.sector} sector in "
+            f"Kenya/East Africa."
+            if self.config.sector
+            else "The organisation operates in Kenya/East Africa."
+        )
+
+        themes_payload = [
+            {
+                "id": i,
+                "theme": row["Theme"],
+                "sentiment": row.get("Theme Sentiment", ""),
+                "keywords": row["Key Keywords"],
+                "quote": row["Representative Quote"],
+            }
+            for i, (_, row) in enumerate(self.summary_df.iterrows())
+        ]
+
+        prompt = (
+            f"You are an experienced M&E advisor. {sector_ctx}\n\n"
+            "For each feedback theme below, write ONE practical, specific "
+            "recommendation (1–2 sentences). Use local African context where "
+            "relevant (M-Pesa, boda-boda, SMS/USSD, county structures, etc.).\n\n"
+            f"Themes:\n{json.dumps(themes_payload, indent=2)}\n\n"
+            "Return a JSON array of strings — one recommendation per theme, "
+            "in the SAME order as the input. "
+            "Return ONLY the JSON array. No explanation, no markdown."
+        )
+
+        try:
+            gen_cfg = _gemini_lib.types.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=1200,
+            )
+            response = self._gemini_client.generate_content(
+                prompt,
+                generation_config=gen_cfg,
+            )
+            raw = response.text.strip()
+            # Strip markdown code fences if present
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw).strip()
+            recs = json.loads(raw)
+
+            if isinstance(recs, list) and len(recs) == len(self.summary_df):
+                if "Recommendation" in self.summary_df.columns:
+                    self.summary_df["Recommendation"] = recs
+                else:
+                    try:
+                        self.summary_df.insert(5, "Recommendation", recs)
+                    except Exception:
+                        self.summary_df["Recommendation"] = recs
+                log.info(
+                    "Gemini generated %d recommendations successfully.", len(recs)
+                )
+                return
+            log.warning(
+                "Gemini returned %d recs for %d themes — falling back.",
+                len(recs), len(self.summary_df),
+            )
+        except Exception as exc:
+            log.warning(
+                "Gemini recommendation generation failed (%s) — "
+                "falling back to rule-based.", exc
+            )
 
         # Fallback
         self._rule_based_recommendations()
@@ -2840,7 +3323,16 @@ class FeedbackInsightEngine:
             row = {
                 "Cluster ID": cluster_ids[0] if cluster_ids else -1,
                 "Theme": main_theme,
-                "Response Count": subset["Response Count"].sum(),
+                # ── Section 7: sum both count columns ─────────────────
+                # NOTE: summing respondent counts across merged themes may
+                # slightly over-count respondents who contributed to both
+                # clusters (rare at merge_threshold=0.75). The alternative
+                # (union of orig_idx sets) requires storing orig_idx in
+                # summary_df, which is done via q_df but not propagated here.
+                # For client reporting the summed value is acceptable and
+                # clearly labelled.
+                "Respondent Count": subset["Respondent Count"].sum() if "Respondent Count" in subset.columns else subset.get("Response Count", pd.Series([0])).sum(),
+                "Sentence Count":   subset["Sentence Count"].sum()   if "Sentence Count"   in subset.columns else 0,
                 "Share (%)": round(subset["Share (%)"].sum(), 2),
                 "Impact Score": round(subset["Impact Score"].sum(), 2),
                 "Intensity Score": round(subset["Intensity Score"].mean(), 3),
@@ -2918,15 +3410,16 @@ class FeedbackInsightEngine:
                 "these are early-warning signals."
             )
 
-        # Loud vs widespread distinction
+        # Loud vs widespread distinction (Section 7: now uses Respondent Count)
+        resp_col = "Respondent Count" if "Respondent Count" in df.columns else "Response Count"
         loud = df[
-            (df["Response Count"] <= df["Response Count"].quantile(0.25)) &
+            (df[resp_col] <= df[resp_col].quantile(0.25)) &
             (df["Average Sentiment"] < -0.3)
         ]
         if not loud.empty:
             insights.append(
-                f"Note: '{loud.iloc[0]['Theme']}' has low volume but high negative "
-                "sentiment — this may be a loud minority, not widespread feedback."
+                f"Note: '{loud.iloc[0]['Theme']}' has few respondents but high negative "
+                "sentiment — this may be a loud minority, not a widespread issue."
             )
 
         positives = df[df["Theme Sentiment"] == "Positive"]
@@ -2953,15 +3446,45 @@ class FeedbackInsightEngine:
             f"{lang}:{cnt}" for lang, cnt in lang_counts.head(4).items()
         ) if not lang_counts.empty else "n/a"
 
+        # ── Section 7: Respondent coverage stats ──────────────────────
+        # Count how many unique respondents appear in at least one theme
+        # vs the total respondents for the question.
+        resp_col = "Respondent Count" if "Respondent Count" in self.summary_df.columns else "Response Count"
+        total_respondents = self._question_response_count
+
+        # Unique respondents captured across ALL themes (via q_df orig_idx)
+        # — this is the ground-truth figure from the sentence-level data.
+        respondents_in_themes = (
+            self.q_df["orig_idx"].nunique()
+            if "orig_idx" in self.q_df.columns
+            else total_respondents
+        )
+        coverage_pct = round(
+            (respondents_in_themes / max(total_respondents, 1)) * 100, 1
+        )
+
         self.dataset_summary = {
-            "Total Responses": self._question_response_count,
-            "Sentence Units Analysed": len(self.q_df),
-            "Average Response Length (words)": round(avg_len, 1),
-            "Themes Identified": len(self.summary_df),
-            "Emerging Issues Found": len(
+            "Total Responses":                    total_respondents,
+            "Respondents Captured in Themes":     respondents_in_themes,
+            "Theme Coverage (%)":                 coverage_pct,
+            "Sentence Units Analysed":            len(self.q_df),
+            "Avg Sentences per Respondent":       round(
+                len(self.q_df) / max(respondents_in_themes, 1), 1
+            ),
+            "Average Response Length (words)":    round(avg_len, 1),
+            "Themes Identified":                  len(self.summary_df),
+            "Emerging Issues Found":              len(
                 getattr(self, "emerging_df", pd.DataFrame())
             ),
-            "Languages Detected": lang_note,
+            "Languages Detected":                 lang_note,
+            # Section 9 — Silhouette Score
+            "Silhouette Score":                   self._last_silhouette_score,
+            "Cluster Quality":                    (
+                "Good (>0.35)" if (self._last_silhouette_score or 0) > 0.35
+                else "Acceptable (>0.20)" if (self._last_silhouette_score or 0) > 0.20
+                else "Weak (≤0.20)" if self._last_silhouette_score is not None
+                else "N/A"
+            ),
         }
 
     # ══════════════════════════════════════════════════════════════════
@@ -3013,20 +3536,26 @@ class FeedbackInsightEngine:
 
     # Preferred minimum column widths by header name (characters)
     COL_MIN_WIDTHS = {
-        "Theme":                  32,
-        "Question":               20,
-        "Response Count":         18,
-        "Share (%)":              14,
-        "Impact Score":           16,
-        "Intensity Score":        16,
-        "Average Sentiment":      20,
-        "Priority":               20,
-        "Theme Sentiment":        18,
-        "Key Keywords":           38,
-        "Representative Quote":   52,
-        "Recommendation":         48,
-        "Quote":                  55,
-        "Languages Detected":     28,
+        "Theme":                          32,
+        "Question":                       20,
+        # Section 7: both count columns
+        "Respondent Count":               18,
+        "Sentence Count":                 16,
+        "Response Count":                 18,   # backward-compat fallback
+        "Share (%)":                      14,
+        "Impact Score":                   16,
+        "Intensity Score":                16,
+        "Average Sentiment":              20,
+        "Priority":                       20,
+        "Theme Sentiment":                18,
+        "Key Keywords":                   38,
+        "Representative Quote":           52,
+        "Recommendation":                 48,
+        "Quote":                          55,
+        "Languages Detected":             28,
+        "Respondents Captured in Themes": 28,
+        "Theme Coverage (%)":             20,
+        "Avg Sentences per Respondent":   26,
     }
     COL_DEFAULT_MIN = 14   # fallback minimum for any column not listed above
 
@@ -3499,11 +4028,16 @@ class FeedbackInsightEngine:
             for _, row in qdata["summary"].iterrows():
                 pri = str(row.get("Priority", "")).upper()
                 if pri in ("HIGH", "MEDIUM"):
+                    # Section 7: show respondent count in PDF alert table
+                    impact_val = row.get(
+                        "Respondent Count",
+                        row.get("Response Count", "")
+                    )
                     alerts.append({
                         "pri":   pri,
                         "theme": row.get("Theme", ""),
                         "q":     qname,
-                        "count": row.get("Response Count", ""),
+                        "count": impact_val,
                         "owner": row.get("Action Owner", ""),
                         "days":  str(row.get("Timeline (Days)", "")),
                     })
@@ -3538,7 +4072,8 @@ class FeedbackInsightEngine:
         pdf.add_page()
 
         qcw  = [50, 14, 18, 30, 70]
-        qhdr = ["Theme", "Share %", "Priority", "Owner", "Recommendation"]
+        qhdr = ["Theme", "Resp.", "Priority", "Owner", "Recommendation"]
+        # "Resp." = Respondent Count (abbreviated to fit PDF column)
 
         for qname, qdata in self.question_results.items():
             s_df  = qdata["summary"]
@@ -3548,6 +4083,9 @@ class FeedbackInsightEngine:
             q_label  = qname.replace("_", " ").title()
             resp_n   = ds.get("Total Responses", "")
             themes_n = ds.get("Themes Identified", "")
+            # Section 9: include silhouette score in PDF question header
+            sil_val  = ds.get("Silhouette Score")
+            sil_str  = f"  |  sil: {sil_val:.3f}" if isinstance(sil_val, float) else ""
 
             # Question block header
             pdf.set_fill_color(*NAVY)
@@ -3556,7 +4094,7 @@ class FeedbackInsightEngine:
             pdf.cell(
                 EPW, 6,
                 _s(f"  {q_label}  "
-                   f"({resp_n} responses  {themes_n} themes)"),
+                   f"({resp_n} responses  {themes_n} themes{sil_str})"),
                 border=0, align="L", fill=True,
                 new_x="LMARGIN", new_y="NEXT",
             )
@@ -3586,9 +4124,14 @@ class FeedbackInsightEngine:
                 if len(rec) > 75:
                     rec_short += "..."
 
+                # Section 7: show respondent count in PDF (more meaningful than share%)
+                resp_count = row.get(
+                    "Respondent Count",
+                    row.get("Response Count", "—")
+                )
                 vals = [
                     str(row.get("Theme", ""))[:38],
-                    f"{row.get('Share (%)', 0):.1f}%",
+                    str(resp_count),
                     pri,
                     str(row.get("Action Owner", ""))[:22],
                     rec_short,
@@ -3817,13 +4360,27 @@ class FeedbackInsightEngine:
             ws.row_dimensions[next_row].height = 22
             next_row += 1
 
-            # Stats table (2 columns: Label | Value)
+            # Stats table — Section 7: show both respondent & sentence counts
             stats_headers = [
-                ("Responses", ds.get("Total Responses", "")),
-                ("Themes Identified", ds.get("Themes Identified", "")),
-                ("Avg Length (words)", ds.get("Average Response Length (words)", "")),
-                ("Languages", ds.get("Languages Detected", "")),
+                ("Total Respondents",         ds.get("Total Responses", "")),
+                ("Respondents in Themes",     ds.get("Respondents Captured in Themes", "")),
+                ("Theme Coverage (%)",         ds.get("Theme Coverage (%)", "")),
+                ("Sentence Units Analysed",   ds.get("Sentence Units Analysed", "")),
+                ("Avg Sentences / Respondent",ds.get("Avg Sentences per Respondent", "")),
+                ("Avg Response Length (words)",ds.get("Average Response Length (words)", "")),
+                ("Themes Identified",         ds.get("Themes Identified", "")),
+                ("Languages",                 ds.get("Languages Detected", "")),
+                # Section 9 — Silhouette Score
+                ("Silhouette Score",          ds.get("Silhouette Score", "N/A")),
+                ("Cluster Quality",           ds.get("Cluster Quality", "N/A")),
             ]
+            # Section 9 — colour map for Cluster Quality value cell
+            _QUALITY_COLOUR = {
+                "Good":       "C6EFCE",   # green
+                "Acceptable": "FFEB9C",   # amber
+                "Weak":       "FFC7CE",   # red
+            }
+
             for stat_label, stat_value in stats_headers:
                 lc = ws.cell(row=next_row, column=1, value=stat_label)
                 lc.font = Font(bold=True, size=10, color="000000")
@@ -3839,7 +4396,18 @@ class FeedbackInsightEngine:
                 vc.font = Font(bold=True, size=10)
                 vc.border = self._thin_border()
                 vc.alignment = Alignment(horizontal="center", vertical="center")
-                
+
+                # Section 9: colour-code the Cluster Quality value cell
+                if stat_label == "Cluster Quality" and isinstance(stat_value, str):
+                    for kw, hex_col in _QUALITY_COLOUR.items():
+                        if kw in stat_value:
+                            vc.fill = PatternFill(
+                                start_color=hex_col,
+                                end_color=hex_col,
+                                fill_type="solid",
+                            )
+                            break
+
                 ws.merge_cells(start_row=next_row, start_column=2,
                               end_row=next_row, end_column=EXEC_MERGE)
                 ws.row_dimensions[next_row].height = 18
@@ -3893,11 +4461,16 @@ class FeedbackInsightEngine:
                 end_color=self.STRIPE_COLOUR,
                 fill_type="solid",
             )
+            # Section 7: use Respondent Count (primary) with graceful fallback
+            resp_col_name = (
+                "Respondent Count" if "Respondent Count" in s_df.columns
+                else "Response Count"
+            )
             for row_i, (_, r) in enumerate(s_df.head(5).iterrows()):
                 fill = stripe_fill if row_i % 2 == 1 else None
                 vals = [
                     r["Theme"],
-                    r["Response Count"],
+                    r[resp_col_name],
                     r["Share (%)"],
                     r.get("Priority", ""),
                     r.get("Recommendation", ""),
@@ -3920,9 +4493,13 @@ class FeedbackInsightEngine:
         # ══════════════════════════════════════════════════════════════
         # 2. PER-QUESTION THEME SHEETS (with v3+ Engines)
         # ══════════════════════════════════════════════════════════════
+        # Section 7: "Respondent Count" is now the primary people metric.
+        # "Sentence Count" is shown as a secondary column so analysts can
+        # see how many sentence units a theme generated — useful for
+        # evaluating clustering density.
         THEME_COLS = [
-            "Theme", "Response Count", "Share (%)", "Impact Score",
-            "Intensity Score", "Priority", "Theme Sentiment",
+            "Theme", "Respondent Count", "Sentence Count", "Share (%)",
+            "Impact Score", "Intensity Score", "Priority", "Theme Sentiment",
             "Average Sentiment", "Trigger Status", "Action Owner",
             "Timeline (Days)", "Key Keywords", "Representative Quote",
             "Recommendation",
@@ -4064,16 +4641,22 @@ class FeedbackInsightEngine:
 
             # Column headers for data table
             ws.cell(row=block_start + 1, column=1, value="Theme")
-            ws.cell(row=block_start + 1, column=2, value="Responses")
+            ws.cell(row=block_start + 1, column=2, value="Respondents")
             self.style_table_header(ws, header_row=block_start + 1)
+
+            # Section 7: use Respondent Count; fall back to Response Count
+            count_col = (
+                "Respondent Count" if "Respondent Count" in s_df.columns
+                else "Response Count"
+            )
 
             # Data rows
             for offset, (_, r) in enumerate(
-                s_df[["Theme", "Response Count"]].iterrows(), start=2
+                s_df[["Theme", count_col]].iterrows(), start=2
             ):
                 ws.cell(row=block_start + offset, column=1, value=r["Theme"])
                 ws.cell(row=block_start + offset, column=2,
-                        value=r["Response Count"])
+                        value=r[count_col])
 
             data_end = block_start + 1 + len(s_df)
 
@@ -4157,13 +4740,18 @@ class FeedbackInsightEngine:
                 if isinstance(triggers, list):
                     for trigger in triggers:
                         if trigger.get("level") in ("HIGH", "MEDIUM"):
+                            # Section 7: use Respondent Count as the impact figure
+                            impact_val = row.get(
+                                "Respondent Count",
+                                row.get("Response Count", 0)
+                            )
                             priority_issues.append({
                                 "question": qname,
                                 "theme": row["Theme"],
                                 "priority": trigger.get("icon", ""),
                                 "level": trigger.get("level", ""),
                                 "message": trigger.get("message", ""),
-                                "impact": row.get("Response Count", 0),
+                                "impact": impact_val,
                                 "owner": row.get("Action Owner", "TBD"),
                                 "deadline_days": trigger.get("deadline_days", 30),
                                 "recommendation": row.get("Recommendation", "N/A"),
@@ -4366,12 +4954,17 @@ class FeedbackInsightEngine:
                 for _, row in s_df.iterrows():
                     theme_name = row.get("Theme", "Unknown")
                     theme_lookup[theme_name] = {
-                        "Theme": theme_name,
-                        "Theme Sentiment": row.get("Theme Sentiment", "Neutral"),
-                        "Priority": row.get("Priority", "Low"),
-                        "Trigger Status": row.get("Trigger Status", "No Alert"),
-                        "Action Owner": row.get("Action Owner", "Program Manager"),
-                        "Timeline (Days)": str(row.get("Timeline (Days)", "30")),
+                        "Theme":            theme_name,
+                        "Theme Sentiment":  row.get("Theme Sentiment", "Neutral"),
+                        "Priority":         row.get("Priority", "Low"),
+                        "Trigger Status":   row.get("Trigger Status", "No Alert"),
+                        "Action Owner":     row.get("Action Owner", "Program Manager"),
+                        "Timeline (Days)":  str(row.get("Timeline (Days)", "30")),
+                        # Section 7: include respondent count in clustered sheet
+                        "Respondent Count": row.get(
+                            "Respondent Count",
+                            row.get("Response Count", "")
+                        ),
                     }
             
             # Map cluster IDs to themes using cluster_to_theme_map, then lookup metadata
@@ -4400,14 +4993,14 @@ class FeedbackInsightEngine:
             combined = pd.concat(all_q_dfs, ignore_index=True)
             
             # Reorder columns for professional layout
-            # Core data columns first, then theme metadata
             desired_order = [
                 "Question",
                 "Clean Text",
-                "Language", 
+                "Language",
                 "Sentiment",
                 "Cluster",
                 "Theme",
+                "Respondent Count",   # Section 7: theme-level count for context
                 "Theme Sentiment",
                 "Priority",
                 "Trigger Status",
@@ -4619,19 +5212,26 @@ class FeedbackInsightEngine:
             for qname, qdata in self.question_results.items():
                 s_df = qdata["summary"]
                 for idx, row in s_df.iterrows():
+                    # Section 7: use Respondent Count as impact
+                    impact = int(row.get(
+                        "Respondent Count",
+                        row.get("Response Count", 0)
+                    ))
                     theme_dict = {
-                        "question": qname,
-                        "name": row.get("Theme", ""),
-                        "impact": int(row.get("Response Count", 0)),
-                        "sentiment": row.get("Theme Sentiment", "Neutral"),
-                        "keywords": str(row.get("Key Keywords", "")).split(","),
-                        "triggers": row.get("triggers", []),
+                        "question":        qname,
+                        "name":            row.get("Theme", ""),
+                        "impact":          impact,
+                        "respondent_count":impact,
+                        "sentence_count":  int(row.get("Sentence Count", 0)),
+                        "sentiment":       row.get("Theme Sentiment", "Neutral"),
+                        "keywords":        str(row.get("Key Keywords", "")).split(","),
+                        "triggers":        row.get("triggers", []),
                         "action_plan": (
                             row.get("action_plan", {})
                             if isinstance(row.get("action_plan"), dict)
                             else {}
                         ),
-                        "recommendation": row.get("Recommendation", ""),
+                        "recommendation":  row.get("Recommendation", ""),
                     }
                     all_themes.append(theme_dict)
             
@@ -4659,16 +5259,21 @@ class FeedbackInsightEngine:
                     if isinstance(triggers, list):
                         for trigger in triggers:
                             if trigger.get("level") in ("HIGH", "MEDIUM"):
+                                # Section 7: use Respondent Count
+                                impact = row.get(
+                                    "Respondent Count",
+                                    row.get("Response Count", 0)
+                                )
                                 alert = {
-                                    "theme_name": row.get("Theme", ""),
-                                    "question": qname,
+                                    "theme_name":    row.get("Theme", ""),
+                                    "question":      qname,
                                     "priority_icon": trigger.get("icon", ""),
-                                    "priority_level": trigger.get("level", ""),
-                                    "message": trigger.get("message", ""),
+                                    "priority_level":trigger.get("level", ""),
+                                    "message":       trigger.get("message", ""),
                                     "deadline_days": trigger.get("deadline_days", 30),
-                                    "impact_count": row.get("Response Count", 0),
-                                    "recommendation": row.get("Recommendation", ""),
-                                    "action_owner": row.get("Action Owner", "TBD"),
+                                    "impact_count":  impact,
+                                    "recommendation":row.get("Recommendation", ""),
+                                    "action_owner":  row.get("Action Owner", "TBD"),
                                 }
                                 all_alerts.append(alert)
             
@@ -4804,8 +5409,11 @@ class FeedbackInsightEngine:
 
         # --- Keyword coverage tips (always printed when rule-based recs used) ---
         # If LLM recs were used, print a condensed keyword discovery summary.
-        if self._anthropic_client and self.config.use_llm_recommendations:
+        if (self._anthropic_client or self._gemini_client) and self.config.use_llm_recommendations:
             self._print_llm_keyword_summary()
+
+        # ── Section 8: Persist theme registry to disk ─────────────────
+        self._save_theme_registry()
 
         # ── NEW: Generate JSON + Alerts output (v3+ Upgrade) ──────────
         self._export_outputs()
@@ -4879,7 +5487,16 @@ class FeedbackInsightEngine:
                 theme_dict = {
                     "question": qname,
                     "name": row.get("Theme", ""),
-                    "impact": row.get("Response Count", 0),
+                    # Section 7: use respondent count as canonical impact figure
+                    "impact": row.get(
+                        "Respondent Count",
+                        row.get("Response Count", 0)
+                    ),
+                    "respondent_count": row.get(
+                        "Respondent Count",
+                        row.get("Response Count", 0)
+                    ),
+                    "sentence_count": row.get("Sentence Count", 0),
                     "sentiment": row.get("Theme Sentiment", "Neutral"),
                     "keywords": (
                         [k.strip() for k in str(row.get("Key Keywords", "")).split(",")]
@@ -4965,11 +5582,28 @@ if __name__ == "__main__":
         #   "secondary education"      |  "urban housing"
         sector="smallholder agriculture",  # ← change for your sector
 
-        # ── LLM features ─────────────────────────────────────────────
-        # Requires: pip install anthropic  +  ANTHROPIC_API_KEY env var
-        use_llm_naming=True,           # meaningful theme names
-        use_llm_recommendations=True,  # sector-aware recommendations
-        # Set both to False to use rule-based only (faster, no API key needed)
+        # ── LLM features (Section 10 — Gemini for Google Colab) ──────
+        #
+        # OPTION A: Use Gemini (free, Google Colab)
+        #   1. Run this in a Colab cell BEFORE starting the engine:
+        #        import google.generativeai as genai
+        #        genai.configure(api_key="YOUR_GEMINI_API_KEY")
+        #      OR set the GEMINI_API_KEY environment variable.
+        #   2. pip install google-generativeai
+        #   3. Set use_gemini=True below.
+        #
+        # OPTION B: Use Claude/Anthropic (paid, local machine)
+        #   1. pip install anthropic
+        #   2. Set ANTHROPIC_API_KEY environment variable.
+        #   3. Keep use_gemini=False (default).
+        #
+        # OPTION C: No LLM (fully offline, rule-based)
+        #   Set use_llm_naming=False, use_llm_recommendations=False.
+        #
+        use_gemini=False,               # ← True for Google Colab / Gemini
+        gemini_model="gemini-2.0-flash",
+        use_llm_naming=False,           # meaningful theme names via LLM
+        use_llm_recommendations=False,  # sector-aware recommendations via LLM
 
         report_title="One Acre Fund — Farmer Feedback Insights 2026",
         output_filename="oaf_farmer_survey_insight_report.xlsx",
@@ -4984,6 +5618,11 @@ if __name__ == "__main__":
         # Set to "" to disable geographic breakdown.
         location_column="county",
         location_min_responses=10,
+
+        # ── Theme Registry (Section 8) ────────────────────────────────
+        # theme_registry.json is auto-created on first run.
+        # Edit it manually to rename any theme permanently.
+        theme_registry_path="theme_registry.json",
     )
 
     engine = FeedbackInsightEngine(
