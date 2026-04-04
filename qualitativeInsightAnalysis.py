@@ -366,6 +366,13 @@ try:
 except ImportError:
     FPDF_AVAILABLE = False
 
+try:
+    import hdbscan as _hdbscan_lib
+    HDBSCAN_AVAILABLE = True
+except ImportError:
+    _hdbscan_lib = None
+    HDBSCAN_AVAILABLE = False
+
 # ── Sentiment complaint-signal layer (Phase 1 accuracy upgrade) ───────
 try:
     from sentiment_config import compute_complaint_adjustment
@@ -459,11 +466,27 @@ class EngineConfig:
     """All tuneable parameters in one place."""
 
     # --- Clustering ---
-    pca_components: int = 64          # dims after PCA (≤ 384); reduces RAM
+    pca_components: int = 100         # dims after PCA (≤ 384); 100 preserves
+                                       # more topic structure than 64 while
+                                       # staying safe on 8 GB RAM.
     min_cluster_size: int = 5         # hard minimum for a "real" cluster
     emerging_min_size: int = 2        # below this → ignored entirely
-    max_clusters: int = 20            # cap for very large datasets
+    max_clusters: int = 20            # cap when falling back to KMeans
     merge_threshold: float = 0.75     # cosine sim for theme merging
+
+    # --- HDBSCAN (Clustering upgrade) ---
+    use_hdbscan: bool = True
+    # When True (default): use HDBSCAN — discovers the number of themes
+    # automatically, handles unequal cluster sizes, marks noise cleanly.
+    # Requires:  pip install hdbscan
+    # When False OR hdbscan not installed: falls back to KMeans with
+    # silhouette-guided k selection across ALL dataset sizes.
+
+    hdbscan_min_samples: int = 3
+    # HDBSCAN: minimum number of neighbouring points for a core point.
+    # Lower  → more clusters, finer-grained themes.
+    # Higher → fewer clusters, broader themes.
+    # Recommended range: 2–5 for survey data.
 
     # --- Embedding model (Section 2) ---
     embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -2352,34 +2375,79 @@ class FeedbackInsightEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def generate_embeddings(self) -> None:
-        texts = self.q_df["compressed_text"].tolist()
-        unique_texts = list(dict.fromkeys(texts))  # order-preserving dedup
+        """
+        CLUSTERING UPGRADE — Response-level embedding strategy.
 
-        log.info("Encoding %d unique sentence units …", len(unique_texts))
+        WHY RESPONSE-LEVEL?
+        Previously we embedded individual sentences.  One response split
+        into 3 sentences could land in 3 different clusters, scattering
+        a single person's feedback across unrelated themes.
 
-        # batch_size=32: safe for the multilingual L12 model on 8 GB RAM.
-        # (L6 English-only model could use 64, but L12 is ~2× the parameters.)
+        NOW:
+          1. Aggregate all sentence text per respondent (orig_idx).
+          2. Embed the full aggregated response — one vector per person.
+          3. Store response-level embeddings for clustering.
+          4. After clustering, propagate the cluster label back to every
+             sentence row that belongs to that respondent.
+
+        For respondents whose text is a single sentence the behaviour is
+        identical to before.  For multi-sentence respondents, all their
+        sentences land in the same cluster — which is correct.
+
+        PCA: 384 → pca_components (default 100, up from 64).
+        100 dims preserves more topic structure while remaining safe on 8 GB RAM.
+        """
+        # ── Step 1: aggregate sentences per respondent ────────────────
+        if "orig_idx" in self.q_df.columns:
+            # Join all cleaned sentences for each respondent into one text
+            resp_texts = (
+                self.q_df
+                .groupby("orig_idx")["compressed_text"]
+                .apply(lambda parts: " ".join(parts.tolist()))
+                .reset_index()
+            )
+            resp_ids   = resp_texts["orig_idx"].tolist()
+            texts_to_embed = resp_texts["compressed_text"].tolist()
+            response_level = True
+        else:
+            # Fallback: sentence-level (backward compatible)
+            texts_to_embed = self.q_df["compressed_text"].tolist()
+            resp_ids = list(range(len(texts_to_embed)))
+            response_level = False
+
+        # ── Step 2: encode (unique texts only to save time) ───────────
+        unique_texts = list(dict.fromkeys(texts_to_embed))
+        log.info(
+            "Encoding %d unique %s …",
+            len(unique_texts),
+            "responses (response-level clustering)" if response_level
+            else "sentence units",
+        )
         unique_embeddings = self.model.encode(
             unique_texts,
             batch_size=32,
             show_progress_bar=False,
             convert_to_numpy=True,
         )
-
         embedding_map = dict(zip(unique_texts, unique_embeddings))
-        self.embeddings = np.array([embedding_map[t] for t in texts])
+        resp_embeddings = np.array([embedding_map[t] for t in texts_to_embed])
 
-        # PCA: reduce 384 → config.pca_components to save RAM & speed up KMeans
+        # ── Step 3: PCA on response-level embeddings ──────────────────
         n_components = min(
             self.config.pca_components,
-            self.embeddings.shape[0] - 1,
-            self.embeddings.shape[1],
+            resp_embeddings.shape[0] - 1,
+            resp_embeddings.shape[1],
         )
-        log.info("PCA: %d → %d dims", self.embeddings.shape[1], n_components)
+        log.info("PCA: %d → %d dims", resp_embeddings.shape[1], n_components)
         pca = PCA(n_components=n_components, random_state=42)
-        self.embeddings = pca.fit_transform(self.embeddings).astype(np.float32)
+        resp_embeddings_pca = pca.fit_transform(resp_embeddings).astype(np.float32)
 
-        del unique_embeddings
+        # Store response-level embeddings and id mapping for cluster_feedback()
+        self.embeddings      = resp_embeddings_pca   # shape: (n_responses, pca_dims)
+        self._resp_ids       = resp_ids              # list of orig_idx values
+        self._response_level = response_level
+
+        del unique_embeddings, resp_embeddings
         gc.collect()
 
     # ═══════════════════════════════════════════════════════════════════
@@ -2439,68 +2507,165 @@ class FeedbackInsightEngine:
         return embeddings
 
     # ══════════════════════════════════════════════════════════════════
-    # CLUSTER COUNT SELECTION
+    # CLUSTERING  ─ HDBSCAN primary / silhouette-KMeans fallback
     # ══════════════════════════════════════════════════════════════════
 
-    def choose_clusters(self) -> int:
-        n = len(self.q_df)
+    def _kmeans_best_k(self) -> Tuple[np.ndarray, int, float]:
+        """
+        Silhouette-guided KMeans — searches k across ALL dataset sizes.
 
-        if n < 200:
-            best_k, best_score = 2, -1.0
-            for k in range(2, min(9, n)):
-                km = KMeans(n_clusters=k, random_state=42, n_init=10)
-                labels = km.fit_predict(self.embeddings)
-                score = silhouette_score(self.embeddings, labels,
-                                         sample_size=min(500, n))
-                if score > best_score:
-                    best_k, best_score = k, score
-            # Section 9: store so generate_dataset_summary() can report it
-            self._last_silhouette_score = round(float(best_score), 3)
-            return best_k
+        Replaces the old √(n/2) heuristic entirely.  Tries k = 2 to
+        min(max_clusters, n//2) and picks the k with the highest
+        silhouette score.  Uses a 1 000-point sample for speed.
 
-        suggested = int(np.sqrt(n / 2))
-        k = min(suggested, self.config.max_clusters)
-        # Section 9: compute silhouette post-hoc for large datasets too
-        # (sampled at 1 000 points so it stays fast on 8 GB RAM)
-        self._last_silhouette_score = None   # computed after clustering in cluster_feedback()
-        return k
+        Returns:
+            (labels, best_k, best_silhouette_score)
+        """
+        n = len(self.embeddings)
+        k_min = 2
+        k_max = min(self.config.max_clusters, max(2, n // 2))
+        # Limit search range to keep runtime reasonable
+        k_range = range(k_min, min(k_max + 1, 16))
 
-    # ══════════════════════════════════════════════════════════════════
-    # CLUSTERING  ─ MiniBatchKMeans for large datasets
-    # ══════════════════════════════════════════════════════════════════
+        best_k, best_score, best_labels = k_min, -1.0, None
 
-    def cluster_feedback(self) -> None:
-        k = self.choose_clusters()
-        log.info("Clustering into k=%d groups …", k)
-
-        n = len(self.q_df)
-        if n > self.config.large_dataset_threshold:
-            self.kmeans = MiniBatchKMeans(
-                n_clusters=k,
-                random_state=42,
-                n_init=5,
-                batch_size=min(1024, n),
-            )
-        else:
-            self.kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-
-        self.q_df["cluster"] = self.kmeans.fit_predict(self.embeddings)
-
-        # Section 9: for large datasets compute silhouette AFTER fitting.
-        # Sample at most 1 000 points so it stays fast on 8 GB RAM.
-        if self._last_silhouette_score is None and k >= 2:
+        for k in k_range:
+            if k >= n:
+                break
             try:
-                sil = silhouette_score(
-                    self.embeddings,
-                    self.q_df["cluster"],
+                if n > self.config.large_dataset_threshold:
+                    km = MiniBatchKMeans(
+                        n_clusters=k, random_state=42, n_init=5,
+                        batch_size=min(1024, n),
+                    )
+                else:
+                    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+
+                labels = km.fit_predict(self.embeddings)
+                # Need at least 2 distinct labels for silhouette
+                if len(set(labels)) < 2:
+                    continue
+                score = silhouette_score(
+                    self.embeddings, labels,
                     sample_size=min(1_000, n),
                     random_state=42,
                 )
-                self._last_silhouette_score = round(float(sil), 3)
+                if score > best_score:
+                    best_k, best_score, best_labels = k, score, labels
             except Exception:
-                self._last_silhouette_score = None
+                continue
 
-        quality = ""
+        if best_labels is None:
+            # Last-resort fallback
+            km = KMeans(n_clusters=k_min, random_state=42, n_init=10)
+            best_labels = km.fit_predict(self.embeddings)
+            best_score  = -1.0
+
+        return best_labels, best_k, best_score
+
+    def cluster_feedback(self) -> None:
+        """
+        CLUSTERING UPGRADE — HDBSCAN primary, silhouette-KMeans fallback.
+
+        HDBSCAN PATH (use_hdbscan=True AND hdbscan installed):
+          • Discovers the number of themes automatically — no k needed.
+          • Handles clusters of very different sizes (a survey reality).
+          • Labels noise points as -1; these go to emerging issues.
+          • min_cluster_size from config controls theme granularity.
+
+        KMEANS FALLBACK (use_hdbscan=False OR hdbscan not installed):
+          • Silhouette-guided k search across ALL dataset sizes.
+          • The old √(n/2) heuristic is completely removed.
+          • Tries k = 2 → min(max_clusters, 15), picks best silhouette.
+
+        RESPONSE → SENTENCE LABEL PROPAGATION:
+          Clustering runs on response-level embeddings (one vector per
+          respondent).  After labels are assigned, each sentence in
+          q_df inherits the cluster label of its parent response via
+          orig_idx.  This keeps one person's feedback in one theme.
+        """
+        n_resp = len(self.embeddings)   # number of responses (not sentences)
+        resp_labels: np.ndarray
+
+        use_hdbscan = (
+            self.config.use_hdbscan
+            and HDBSCAN_AVAILABLE
+        )
+
+        if use_hdbscan:
+            # ── HDBSCAN clustering ────────────────────────────────────
+            log.info(
+                "HDBSCAN clustering (min_cluster_size=%d, min_samples=%d) …",
+                self.config.min_cluster_size,
+                self.config.hdbscan_min_samples,
+            )
+            clusterer = _hdbscan_lib.HDBSCAN(
+                min_cluster_size=self.config.min_cluster_size,
+                min_samples=self.config.hdbscan_min_samples,
+                metric="euclidean",
+                cluster_selection_method="eom",   # excess of mass — better for unequal sizes
+                prediction_data=False,
+            )
+            resp_labels = clusterer.fit_predict(self.embeddings)
+            n_clusters  = len(set(resp_labels)) - (1 if -1 in resp_labels else 0)
+            n_noise     = int((resp_labels == -1).sum())
+            log.info(
+                "HDBSCAN found %d clusters, %d noise points",
+                n_clusters, n_noise,
+            )
+
+            # ── BUG FIX: automatic KMeans retry when HDBSCAN finds nothing ──
+            # This happens when the dataset is small or very uniform after
+            # deduplication (e.g. 132 highly similar sentences).
+            # HDBSCAN requires enough density to form clusters; when it can't,
+            # it labels everything -1.  KMeans always assigns every point to a
+            # cluster, so it is the correct fallback for these cases.
+            if n_clusters == 0:
+                log.warning(
+                    "HDBSCAN found 0 clusters — dataset too small or too uniform "
+                    "for density-based clustering (n=%d).  "
+                    "Falling back to silhouette-guided KMeans automatically.",
+                    n_resp,
+                )
+                resp_labels, best_k, best_sil = self._kmeans_best_k()
+                log.info("KMeans fallback: best k=%d  silhouette=%.3f", best_k, best_sil)
+                self._last_silhouette_score = round(float(best_sil), 3)
+                self._cluster_labels = resp_labels
+                self.kmeans = None
+            else:
+                # Store a sentinel so filter_clusters knows labels_ source
+                self.kmeans = None
+                self._cluster_labels = resp_labels
+
+                # Silhouette on non-noise points (Section 9)
+                non_noise_mask = resp_labels != -1
+                if non_noise_mask.sum() >= 10 and n_clusters >= 2:
+                    try:
+                        sil = silhouette_score(
+                            self.embeddings[non_noise_mask],
+                            resp_labels[non_noise_mask],
+                            sample_size=min(1_000, int(non_noise_mask.sum())),
+                            random_state=42,
+                        )
+                        self._last_silhouette_score = round(float(sil), 3)
+                    except Exception:
+                        self._last_silhouette_score = None
+                else:
+                    self._last_silhouette_score = None
+
+        else:
+            # ── Silhouette-guided KMeans fallback ─────────────────────
+            log.info(
+                "HDBSCAN %s — using silhouette-guided KMeans …",
+                "not installed" if not HDBSCAN_AVAILABLE else "disabled",
+            )
+            resp_labels, best_k, best_sil = self._kmeans_best_k()
+            log.info("Best k=%d  silhouette=%.3f", best_k, best_sil)
+            self._last_silhouette_score = round(float(best_sil), 3)
+            self._cluster_labels = resp_labels
+            self.kmeans = None   # no longer needed downstream
+
+        # Log silhouette quality (Section 9)
         if self._last_silhouette_score is not None:
             s = self._last_silhouette_score
             quality = "good" if s > 0.35 else ("acceptable" if s > 0.20 else "weak")
@@ -2510,40 +2675,134 @@ class FeedbackInsightEngine:
                 s, quality,
             )
 
+        # ── Propagate response-level labels → sentence rows ───────────
+        if getattr(self, "_response_level", False) and "orig_idx" in self.q_df.columns:
+            # Build orig_idx → cluster dict
+            id_to_cluster = dict(zip(self._resp_ids, resp_labels))
+            self.q_df["cluster"] = self.q_df["orig_idx"].map(id_to_cluster)
+            # Sentences from respondents not in the map → noise
+            self.q_df["cluster"] = self.q_df["cluster"].fillna(-1).astype(int)
+        else:
+            # Sentence-level fallback (backward compatible)
+            self.q_df["cluster"] = resp_labels
+
+        # Store sentence-level cluster array for TF-IDF resync in filter_clusters
+        self._sentence_clusters_pre_filter = self.q_df["cluster"].tolist()
+
     # ══════════════════════════════════════════════════════════════════
     # FILTER CLUSTERS  ─ separate emerging vs discarded
     # ══════════════════════════════════════════════════════════════════
 
     def filter_clusters(self) -> None:
+        """
+        CLUSTERING UPGRADE — noise-aware cluster filtering.
+
+        HDBSCAN marks ambiguous / isolated points as cluster -1 (noise).
+        These are handled separately:
+          • Noise points (-1) with ≥ emerging_min_size sentence units
+            → emerging issues (same as small clusters).
+          • Noise points below emerging_min_size → discarded.
+
+        KMeans fallback: no -1 labels, behaviour identical to before.
+
+        TF-IDF resync no longer uses self.kmeans.labels_ — it uses the
+        original positional index of q_df rows before filtering, which
+        is stable for both HDBSCAN and KMeans paths.
+        """
+        # Record original positions BEFORE any filtering (for TF-IDF resync)
+        original_positions = list(range(len(self.q_df)))
+
         counts = self.q_df["cluster"].value_counts()
-        min_s = self.config.min_cluster_size
+        min_s        = self.config.min_cluster_size
         emerging_min = self.config.emerging_min_size
 
-        valid = counts[counts >= min_s].index
-        emerging = counts[(counts >= emerging_min) & (counts < min_s)].index
+        # Noise label -1 is treated as emerging if large enough, else discarded
+        valid    = counts[(counts >= min_s) & (counts.index != -1)].index
+        emerging = counts[
+            (counts >= emerging_min) & (counts < min_s) & (counts.index != -1)
+        ].index
+        # Also treat noise points (-1) as emerging if there are enough of them
+        noise_count = counts.get(-1, 0)
+        # BUG FIX: if there are NO valid clusters at all and noise is large,
+        # treat the noise pool as emerging rather than silently discarding
+        # everything and producing an empty q_df.
+        if len(valid) == 0 and noise_count >= emerging_min:
+            include_noise_as_emerging = True
+        else:
+            include_noise_as_emerging = (
+                noise_count >= emerging_min and noise_count < min_s
+            )
 
         self.emerging_df = self.q_df[
             self.q_df["cluster"].isin(emerging)
+            | (self.q_df["cluster"] == -1) & include_noise_as_emerging
         ].copy().reset_index(drop=True)
 
         self.q_df = self.q_df[
             self.q_df["cluster"].isin(valid)
         ].copy().reset_index(drop=True)
 
+        n_discarded = (
+            len(counts)
+            - len(valid)
+            - len(emerging)
+            - (1 if noise_count > 0 else 0)
+        )
         log.info(
-            "Clusters: %d main | %d emerging | discarded: %d",
-            len(valid), len(emerging),
-            len(counts) - len(valid) - len(emerging),
+            "Clusters: %d main | %d emerging | noise=%d | discarded: %d",
+            len(valid), len(emerging), noise_count, max(0, n_discarded),
         )
 
-        # Re-sync the TF-IDF matrix rows to match the filtered q_df.
-        # extract_keywords() uses q_df.index values to slice tfidf_matrix,
-        # so both must share the same positional indices after filtering.
-        valid_positions = [
-            i for i, c in enumerate(
-                self.kmeans.labels_
-            ) if c in valid
-        ]
+        # ── TF-IDF matrix resync ──────────────────────────────────────
+        # We need to keep only the TF-IDF rows that correspond to sentence
+        # units still in q_df after filtering.  We track this via the
+        # original positional indices (0..N-1 before filtering).
+        #
+        # q_df before filtering had positions 0..N-1.
+        # After reset_index(drop=True) the surviving rows are a subset.
+        # We reconstruct which original positions are kept by checking
+        # which orig_idx / cluster combinations survived.
+        #
+        # Simple approach: keep rows whose cluster is in valid.
+        # We recorded original_positions above before any filtering.
+        # q_df.index after filtering corresponds to original positions
+        # because we did NOT reset_index before recording them.
+        valid_set = set(valid)
+        # Recompute: which of the original sentence rows are valid?
+        # We need the original q_df (before this function mutated it).
+        # Use self._cluster_labels propagated back to sentences as proxy:
+        # The TF-IDF matrix was built from q_df BEFORE clustering.
+        # q_df["cluster"] was set in cluster_feedback on the same rows.
+        # We recorded original_positions = range(len(q_df)) at start.
+        # After the two copy() calls above, self.q_df is the valid subset.
+        # The valid rows are those whose index was in original_positions
+        # AND whose cluster was in valid_set.
+        #
+        # Because we haven't reset_index yet at the point we record
+        # original_positions, and cluster_feedback left q_df intact,
+        # the simplest correct approach is:
+        #   valid_positions = indices of rows in (pre-filter q_df)
+        #                     whose cluster is in valid_set.
+        # We can recover this from self._cluster_labels if response-level,
+        # or reconstruct from q_df["cluster"] state.
+        #
+        # Cleanest: store pre-filter cluster series before mutation.
+        # We do this now by using the fact that q_df WAS the full set
+        # and we can infer from len(self.tfidf_matrix) == original N.
+        #
+        # Use a stored pre-filter cluster array set in cluster_feedback:
+        pre_filter_clusters = getattr(self, "_sentence_clusters_pre_filter", None)
+        if pre_filter_clusters is not None:
+            valid_positions = [
+                i for i, c in enumerate(pre_filter_clusters)
+                if c in valid_set
+            ]
+        else:
+            # Fallback: positional match via original_positions
+            valid_positions = [
+                p for p in original_positions
+                if p < self.tfidf_matrix.shape[0]
+            ]
         self.tfidf_matrix = self.tfidf_matrix[valid_positions]
 
     # ══════════════════════════════════════════════════════════════════
@@ -3288,6 +3547,12 @@ class FeedbackInsightEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def merge_similar_themes(self) -> None:
+        # Guard: nothing to merge if summary_df is empty or missing Theme column
+        if self.summary_df.empty or "Theme" not in self.summary_df.columns:
+            log.info("merge_similar_themes: summary_df is empty — skipping.")
+            self.cluster_to_theme_map = {}
+            return
+
         themes = self.summary_df["Theme"].tolist()
         
         # Initialize mapping for all clusters
@@ -5580,10 +5845,18 @@ class FeedbackInsightEngine:
 if __name__ == "__main__":
 
     config = EngineConfig(
-        pca_components=64,
+        # ── Clustering (upgraded) ─────────────────────────────────────
+        pca_components=100,        # 100 dims (up from 64) — better topic
+                                   # structure, still safe on 8 GB RAM
+        use_hdbscan=True,          # HDBSCAN: auto-discovers k, handles
+                                   # unequal cluster sizes. Requires:
+                                   #   pip install hdbscan
+                                   # Falls back to silhouette-KMeans if
+                                   # hdbscan is not installed.
+        hdbscan_min_samples=3,     # lower → finer themes (2–5 recommended)
         min_cluster_size=5,
         emerging_min_size=2,
-        max_clusters=20,
+        max_clusters=20,           # KMeans fallback only
         merge_threshold=0.75,
         tfidf_max_features=5_000,
         large_dataset_threshold=500,
