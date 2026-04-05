@@ -687,6 +687,22 @@ class EngineConfig:
     # Contains actual keywords, sample quotes, and a structured prompt
     # for generating both recommendations AND theme names in one paste.
 
+    # --- Custom action owners (AI-assisted workflow) ---
+    custom_action_owners_path: str = "custom_action_owners.json"
+    # Path to a JSON file containing user-defined action owner rules.
+    # These are loaded at startup and checked BEFORE the built-in
+    # ActionEngine keyword routing — so your entries always win.
+    # Generated via the same ChatGPT workflow as custom_recommendations.json.
+    #
+    # File format:
+    # [
+    #   {
+    #     "keywords": ["loan", "repayment", "mpesa"],
+    #     "owner": "Finance/Loan Management"
+    #   },
+    #   ...
+    # ]
+
 
 # ══════════════════════════════════════════════════════════════════════
 # STOP WORDS  ─ English + Swahili + Sheng + African-English fillers
@@ -1414,6 +1430,56 @@ def _load_custom_recommendations(
         return []
 
 
+def _load_custom_action_owners(
+    path: str = "custom_action_owners.json",
+) -> List[Tuple[List[str], str]]:
+    """
+    Load user-defined action owner rules from a JSON file.
+
+    These rules are checked BEFORE the built-in ActionEngine keyword routing.
+    Your entries always win when keywords match.
+
+    Generated via the ChatGPT workflow (ai_prompt_helper.txt → process_chatgpt_output.py).
+
+    File format:
+    [
+      {
+        "keywords": ["loan", "repayment", "mpesa"],
+        "owner": "Finance/Loan Management"
+      },
+      ...
+    ]
+
+    Returns [] (empty list, no error) if the file does not exist.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            log.warning("custom_action_owners.json must be a JSON array — ignored.")
+            return []
+        rules: List[Tuple[List[str], str]] = []
+        for item in data:
+            kws   = item.get("keywords", [])
+            owner = item.get("owner", "").strip()
+            if kws and owner:
+                rules.append((
+                    [str(k).lower().strip() for k in kws if k],
+                    owner,
+                ))
+        log.info(
+            "Custom action owners loaded: %d rule(s) from %s.",
+            len(rules), p,
+        )
+        return rules
+    except Exception as exc:
+        log.warning("Could not load custom_action_owners.json (%s): %s", p, exc)
+        return []
+
+
 # ══════════════════════════════════════════════════════════════════════
 # RECOMMENDATION RULES  ─ Africa / Kenya context
 # ══════════════════════════════════════════════════════════════════════
@@ -1757,6 +1823,12 @@ class FeedbackInsightEngine:
         # Build the effective rule list: custom first, then built-in
         self._effective_rec_rules: List[Tuple[List[str], str]] = (
             _custom + list(RECOMMENDATION_RULES)
+        )
+
+        # ── Custom action owners (AI-assisted rule-based workflow) ─────
+        # Loaded at startup; checked before ActionEngine keyword routing.
+        self._custom_owner_rules: List[Tuple[List[str], str]] = (
+            _load_custom_action_owners(self.config.custom_action_owners_path)
         )
 
         # ── Section 8: Theme Registry (persistent name stability) ─────
@@ -3364,6 +3436,23 @@ class FeedbackInsightEngine:
                     action_plan = self.action_engine.generate(theme_input) or {}
                 except Exception as exc:
                     log.debug("Action engine error for %s: %s", t["name"], exc)
+
+            # ── Custom action owner override (AI-assisted workflow) ────
+            # Check user-defined rules AFTER ActionEngine so custom entries
+            # always win. Uses the same scored matching as recommendations.
+            theme_text_for_owner = (
+                str(t["name"]) + " " + " ".join(t.get("keywords", []))
+            ).lower()
+            best_owner_score = 0.0
+            for rule_kws, rule_owner in getattr(self, "_custom_owner_rules", []):
+                if not rule_kws:
+                    continue
+                hits  = sum(1 for k in rule_kws if k in theme_text_for_owner)
+                score = hits / len(rule_kws)
+                if score > best_owner_score:
+                    best_owner_score = score
+                    action_plan = dict(action_plan)   # make mutable copy
+                    action_plan["owner"] = rule_owner
 
             # Compose actions string
             actions_list = action_plan.get("actions") if isinstance(action_plan.get("actions"), list) else []
@@ -6076,40 +6165,11 @@ class FeedbackInsightEngine:
 
     def _export_ai_prompt_helper(self) -> None:
         """
-        Write ai_prompt_helper.txt — a ready-to-paste ChatGPT prompt that
-        lets you use AI to generate both recommendations AND theme names
-        without a paid API key.
+        Write ai_prompt_helper.txt — a ready-to-paste ChatGPT prompt covering
+        THREE tasks: recommendations, theme names, and action owners.
 
-        WHEN IS THIS GENERATED?
-        ────────────────────────
-        Always after every run.  Use it when use_llm_recommendations=False
-        (rule-based mode) to improve accuracy with AI-assisted rules.
-
-        WORKFLOW (Issues 3 & 4 — Recommendations + Theme Naming):
-        ───────────────────────────────────────────────────────────
-        STEP 1 — Open ai_prompt_helper.txt.
-        STEP 2 — Paste ALL of its contents into ChatGPT (or any AI tool).
-                 No editing needed — the file contains the full prompt.
-        STEP 3 — ChatGPT returns a JSON object with two sections:
-                   "recommendations" — rules for custom_recommendations.json
-                   "theme_names"     — names for theme_registry.json
-        STEP 4A (Recommendations):
-                 Copy the "recommendations" array.
-                 Save as  custom_recommendations.json  next to the pipeline.
-                 Re-run — your rules are loaded first, accuracy improves.
-        STEP 4B (Theme Names):
-                 Copy the "theme_names" object.
-                 Open theme_registry.json, find each fingerprint, edit the
-                 "name" field to match ChatGPT's suggestion, then re-run.
-                 OR: use engine._theme_registry.rename("old", "new").
-
-        FILE CONTENTS:
-        ──────────────
-        • System context: sector, number of questions analysed.
-        • Per theme: question, current name, keywords, sentiment label,
-          average sentiment score, representative quote, respondent count.
-        • Exact output format specification so ChatGPT returns parseable JSON.
-        • Example of expected output so the AI understands the structure.
+        Always generated after every run.  Paste into ChatGPT, save the JSON
+        response as chatgpt_output.json, then run process_chatgpt_output.py.
         """
         out_path = Path(self.config.ai_prompt_output_path)
 
@@ -6120,20 +6180,21 @@ class FeedbackInsightEngine:
             for _, row in s_df.iterrows():
                 kws = [k.strip() for k in str(row.get("Key Keywords", "")).split(",") if k.strip()]
                 all_themes_for_prompt.append({
-                    "question":        qname,
-                    "current_name":    str(row.get("Theme", "")),
-                    "keywords":        kws,
-                    "sentiment_label": str(row.get("Theme Sentiment", "Neutral")),
-                    "avg_sentiment":   round(float(row.get("Average Sentiment", 0.0)), 3),
-                    "respondent_count":int(row.get("Respondent Count", row.get("Response Count", 0))),
-                    "representative_quote": str(row.get("Representative Quote", "")),
-                    "current_recommendation": str(row.get("Recommendation", "")),
+                    "question":              qname,
+                    "current_name":          str(row.get("Theme", "")),
+                    "keywords":              kws,
+                    "sentiment_label":       str(row.get("Theme Sentiment", "Neutral")),
+                    "avg_sentiment":         round(float(row.get("Average Sentiment", 0.0)), 3),
+                    "respondent_count":      int(row.get("Respondent Count", row.get("Response Count", 0))),
+                    "representative_quote":  str(row.get("Representative Quote", "")),
+                    "current_recommendation":str(row.get("Recommendation", "")),
+                    "current_owner":         str(row.get("Action Owner", "Program Manager")),
                 })
 
         sector_ctx = self.config.sector or "survey feedback analysis"
         n_q        = len(self.question_results)
+        FALLBACK_TEXT = FALLBACK_RECOMMENDATION[:60]  # for comparison in prompt
 
-        # ── Build the prompt ───────────────────────────────────────────
         lines = [
             "=" * 70,
             "AI PROMPT HELPER — FeedbackInsightEngine",
@@ -6147,41 +6208,92 @@ class FeedbackInsightEngine:
             "",
             "I have run an NLP survey analysis pipeline that clustered",
             f"{n_q} open-ended survey question(s) into themes.",
-            "I need your help with TWO tasks:",
+            "I need your help with THREE tasks.",
             "",
+            "━" * 50,
             "TASK 1 — RECOMMENDATIONS:",
-            "For each theme below, write ONE practical, specific recommendation",
-            "(2–4 sentences). Use Kenyan/African context where relevant:",
-            "M-Pesa, boda-boda, SMS/USSD, county structures, barazas, etc.",
-            "The recommendation should directly address the theme's issue.",
-            "Positive themes (sentiment_label=Positive) should get an",
-            "amplification recommendation, not a fix recommendation.",
+            "━" * 50,
+            "For each theme, review the 'current_recommendation'.",
             "",
+            "ONLY rewrite the recommendation if ONE of these is true:",
+            "  a) It starts with 'Conduct targeted focus-group' (generic fallback)",
+            "  b) It clearly does not match the theme's keywords or quote",
+            "  c) It gives advice for the wrong domain (e.g., market advice for a",
+            "     training theme)",
+            "",
+            "If the current recommendation is already specific and relevant,",
+            "return it UNCHANGED — copy it word-for-word.",
+            "",
+            "When writing a NEW recommendation (1–3 sentences):",
+            "  • Address the theme's specific issue directly",
+            "  • Use Kenyan/African context: M-Pesa, boda-boda, SMS/USSD,",
+            "    county structures, barazas, chama groups, etc.",
+            "  • Positive themes (sentiment_label=Positive) → amplification advice,",
+            "    NOT a fix",
+            "",
+            "━" * 50,
             "TASK 2 — THEME NAMES:",
-            "For each theme, suggest a clearer 2–4 word label that a",
-            "non-technical M&E officer would immediately understand.",
-            "The label must reflect the KEYWORDS, not just the current name.",
-            "Examples of good labels:",
-            "  'Late Input Delivery', 'Loan Repayment Burden',",
-            "  'Field Officer Coverage', 'Market Linkage Gaps'",
+            "━" * 50,
+            "For each theme, review the 'current_name'.",
             "",
-            "OUTPUT FORMAT — return ONLY this JSON object, nothing else:",
+            "ONLY suggest a better name if the current name is:",
+            "  a) Unclear or meaningless (e.g., 'Training Session — Suppose')",
+            "  b) A fragment without context (e.g., 'Group Members')",
+            "  c) Wrong domain for the keywords shown",
+            "",
+            "If the current name is already clear and accurate (e.g.,",
+            "'Late Input Delivery', 'Loan Repayment Pressure'), return it",
+            "UNCHANGED — copy it exactly.",
+            "",
+            "Good names are 2–4 words, immediately understood by a non-technical",
+            "M&E officer. Examples:",
+            "  'Late Input Delivery', 'Loan Repayment Burden',",
+            "  'Field Officer Gaps', 'Market Linkage Issues'",
+            "",
+            "━" * 50,
+            "TASK 3 — ACTION OWNERS:",
+            "━" * 50,
+            "For each theme, review the 'current_owner'.",
+            "",
+            "Choose the single most responsible team from this list:",
+            "  • Logistics/Supply Chain    (delivery, transport, collection points)",
+            "  • Finance/Loan Management   (loans, repayment, M-Pesa, credit)",
+            "  • Training/Extension        (training sessions, demos, knowledge)",
+            "  • Field Operations/Staffing (field officer visits, coverage, staff)",
+            "  • Group Mobilization        (group members, chama, community meetings)",
+            "  • Market Linkage            (buyers, market access, prices, sales)",
+            "  • Input Quality/Sourcing    (seeds, fertilizer, input quality)",
+            "  • Program Manager           (general / cross-cutting / unclear)",
+            "",
+            "ONLY change the owner if the current one is clearly wrong.",
+            "If the current owner already matches the theme, return it unchanged.",
+            "",
+            "━" * 50,
+            "OUTPUT FORMAT:",
+            "━" * 50,
+            "Return ONLY this JSON object — no markdown, no explanation:",
             "{",
             '  "recommendations": [',
-            '    {"question": "q1_inputs", "current_name": "Training Session", "recommendation": "..."},',
+            '    {"question": "q1_inputs", "current_name": "Late Input Delivery",',
+            '     "recommendation": "...or unchanged text..."},',
             '    ...',
             '  ],',
             '  "theme_names": [',
-            '    {"question": "q1_inputs", "current_name": "Training Session", "better_name": "..."},',
+            '    {"question": "q1_inputs", "current_name": "Late Input Delivery",',
+            '     "better_name": "...or same name if already good..."},',
+            '    ...',
+            '  ],',
+            '  "action_owners": [',
+            '    {"question": "q1_inputs", "current_name": "Late Input Delivery",',
+            '     "owner": "Logistics/Supply Chain"},',
             '    ...',
             '  ]',
             "}",
             "",
             "IMPORTANT:",
-            "• Return entries in the SAME ORDER as the themes listed below.",
-            "• One entry per theme in each array.",
-            "• Do not skip any theme.",
-            "• Do not add markdown, code fences, or explanation.",
+            "• All three arrays must have ONE entry per theme, in the SAME ORDER.",
+            "• Do NOT skip any theme.",
+            "• Unchanged fields → copy the current value exactly.",
             "",
             "=" * 70,
             "THEME DATA:",
@@ -6196,52 +6308,41 @@ class FeedbackInsightEngine:
                 f"  Current name      : {t['current_name']}",
                 f"  Keywords          : {', '.join(t['keywords'])}",
                 f"  Sentiment label   : {t['sentiment_label']}",
-                f"  Avg sentiment     : {t['avg_sentiment']:+.3f}  "
-                f"(+ve=positive, -ve=negative, 0=neutral)",
+                f"  Avg sentiment     : {t['avg_sentiment']:+.3f}",
                 f"  Respondents       : {t['respondent_count']}",
+                f"  Current owner     : {t['current_owner']}",
                 f"  Representative quote:",
                 f"    \"{t['representative_quote']}\"",
-                f"  Current recommendation (may need improvement):",
+                f"  Current recommendation:",
             ]
-            # Wrap current recommendation for readability
             rec = t["current_recommendation"]
-            for chunk in [rec[j:j+70] for j in range(0, min(len(rec), 280), 70)]:
+            for chunk in [rec[j:j+70] for j in range(0, min(len(rec), 350), 70)]:
                 lines.append(f"    {chunk}")
-            if len(rec) > 280:
+            if len(rec) > 350:
                 lines.append("    [truncated — full text in Excel report]")
             lines.append("")
 
         lines += [
             "=" * 70,
-            "HOW TO USE THE OUTPUT:",
+            "AFTER GETTING THE RESPONSE:",
             "─" * 50,
-            "RECOMMENDATIONS → save as  custom_recommendations.json:",
-            '[',
-            '  {"keywords": ["keyword1", "keyword2", ...], "recommendation": "..."},',
-            '  ...',
-            ']',
-            "Extract the keywords from the theme's keyword list above.",
-            "Include 4–8 of the most specific keywords for that theme.",
-            "",
-            "THEME NAMES → open theme_registry.json and edit the 'name'",
-            "field for the matching entry, then re-run the pipeline.",
+            "1. Save the JSON block ChatGPT returns as  chatgpt_output.json",
+            "2. Run:  python process_chatgpt_output.py",
+            "3. Re-run the pipeline.",
             "=" * 70,
         ]
 
-        prompt_text = "\n".join(lines)
-
         try:
             with open(out_path, "w", encoding="utf-8") as f:
-                f.write(prompt_text)
+                f.write("\n".join(lines))
             log.info(
-                "✅ AI prompt helper written → %s  (%d themes, %d lines)",
-                out_path, len(all_themes_for_prompt), len(lines),
+                "✅ AI prompt helper written → %s  (%d themes)",
+                out_path, len(all_themes_for_prompt),
             )
             print(f"\n{'═' * 62}")
             print(f"  AI PROMPT HELPER saved → {out_path}")
-            print( "  Paste its contents into ChatGPT to get:")
-            print( "    • Accurate recommendations  → custom_recommendations.json")
-            print( "    • Better theme names        → theme_registry.json")
+            print( "  Paste into ChatGPT, save response as chatgpt_output.json,")
+            print( "  then run:  python process_chatgpt_output.py")
             print(f"{'═' * 62}\n")
         except Exception as exc:
             log.warning("Could not write ai_prompt_helper.txt: %s", exc)
