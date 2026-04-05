@@ -687,22 +687,6 @@ class EngineConfig:
     # Contains actual keywords, sample quotes, and a structured prompt
     # for generating both recommendations AND theme names in one paste.
 
-    # --- Custom action owners (AI-assisted workflow) ---
-    custom_action_owners_path: str = "custom_action_owners.json"
-    # Path to a JSON file containing user-defined action owner rules.
-    # These are loaded at startup and checked BEFORE the built-in
-    # ActionEngine keyword routing — so your entries always win.
-    # Generated via the same ChatGPT workflow as custom_recommendations.json.
-    #
-    # File format:
-    # [
-    #   {
-    #     "keywords": ["loan", "repayment", "mpesa"],
-    #     "owner": "Finance/Loan Management"
-    #   },
-    #   ...
-    # ]
-
 
 # ══════════════════════════════════════════════════════════════════════
 # STOP WORDS  ─ English + Swahili + Sheng + African-English fillers
@@ -1430,56 +1414,6 @@ def _load_custom_recommendations(
         return []
 
 
-def _load_custom_action_owners(
-    path: str = "custom_action_owners.json",
-) -> List[Tuple[List[str], str]]:
-    """
-    Load user-defined action owner rules from a JSON file.
-
-    These rules are checked BEFORE the built-in ActionEngine keyword routing.
-    Your entries always win when keywords match.
-
-    Generated via the ChatGPT workflow (ai_prompt_helper.txt → process_chatgpt_output.py).
-
-    File format:
-    [
-      {
-        "keywords": ["loan", "repayment", "mpesa"],
-        "owner": "Finance/Loan Management"
-      },
-      ...
-    ]
-
-    Returns [] (empty list, no error) if the file does not exist.
-    """
-    p = Path(path)
-    if not p.exists():
-        return []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            log.warning("custom_action_owners.json must be a JSON array — ignored.")
-            return []
-        rules: List[Tuple[List[str], str]] = []
-        for item in data:
-            kws   = item.get("keywords", [])
-            owner = item.get("owner", "").strip()
-            if kws and owner:
-                rules.append((
-                    [str(k).lower().strip() for k in kws if k],
-                    owner,
-                ))
-        log.info(
-            "Custom action owners loaded: %d rule(s) from %s.",
-            len(rules), p,
-        )
-        return rules
-    except Exception as exc:
-        log.warning("Could not load custom_action_owners.json (%s): %s", p, exc)
-        return []
-
-
 # ══════════════════════════════════════════════════════════════════════
 # RECOMMENDATION RULES  ─ Africa / Kenya context
 # ══════════════════════════════════════════════════════════════════════
@@ -1823,12 +1757,6 @@ class FeedbackInsightEngine:
         # Build the effective rule list: custom first, then built-in
         self._effective_rec_rules: List[Tuple[List[str], str]] = (
             _custom + list(RECOMMENDATION_RULES)
-        )
-
-        # ── Custom action owners (AI-assisted rule-based workflow) ─────
-        # Loaded at startup; checked before ActionEngine keyword routing.
-        self._custom_owner_rules: List[Tuple[List[str], str]] = (
-            _load_custom_action_owners(self.config.custom_action_owners_path)
         )
 
         # ── Section 8: Theme Registry (persistent name stability) ─────
@@ -3437,23 +3365,6 @@ class FeedbackInsightEngine:
                 except Exception as exc:
                     log.debug("Action engine error for %s: %s", t["name"], exc)
 
-            # ── Custom action owner override (AI-assisted workflow) ────
-            # Check user-defined rules AFTER ActionEngine so custom entries
-            # always win. Uses the same scored matching as recommendations.
-            theme_text_for_owner = (
-                str(t["name"]) + " " + " ".join(t.get("keywords", []))
-            ).lower()
-            best_owner_score = 0.0
-            for rule_kws, rule_owner in getattr(self, "_custom_owner_rules", []):
-                if not rule_kws:
-                    continue
-                hits  = sum(1 for k in rule_kws if k in theme_text_for_owner)
-                score = hits / len(rule_kws)
-                if score > best_owner_score:
-                    best_owner_score = score
-                    action_plan = dict(action_plan)   # make mutable copy
-                    action_plan["owner"] = rule_owner
-
             # Compose actions string
             actions_list = action_plan.get("actions") if isinstance(action_plan.get("actions"), list) else []
             actions_joined = "; ".join(str(a) for a in actions_list) if actions_list else "No action specified"
@@ -4142,28 +4053,32 @@ class FeedbackInsightEngine:
 
     # Preferred minimum column widths by header name (characters)
     COL_MIN_WIDTHS = {
-        "Theme":                          32,
-        "Question":                       20,
+        "Theme":                          34,
+        "Question":                       22,
         # Section 7: both count columns
         "Respondent Count":               18,
         "Sentence Count":                 16,
         "Response Count":                 18,   # backward-compat fallback
-        "Share (%)":                      14,
-        "Impact Score":                   16,
-        "Intensity Score":                16,
+        "Share (%)":                      12,
+        "Impact Score":                   14,
+        "Intensity Score":                15,
         "Average Sentiment":              20,
-        "Priority":                       20,
+        "Priority":                       14,
+        "Trigger Status":                 38,
         "Theme Sentiment":                18,
-        "Key Keywords":                   38,
-        "Representative Quote":           52,
-        "Recommendation":                 48,
-        "Quote":                          55,
+        "Key Keywords":                   45,
+        "Representative Quote":           72,
+        "Recommendation":                 72,
+        "Actions":                        55,
+        "Action Owner":                   26,
+        "Timeline (Days)":                16,
+        "Quote":                          72,
         "Languages Detected":             28,
         "Respondents Captured in Themes": 28,
         "Theme Coverage (%)":             20,
         "Avg Sentences per Respondent":   26,
     }
-    COL_DEFAULT_MIN = 14   # fallback minimum for any column not listed above
+    COL_DEFAULT_MIN = 14
 
     def _thin_border(self):
         thin = Side(style="thin")
@@ -4330,11 +4245,30 @@ class FeedbackInsightEngine:
     # _data_row_height  —  set comfortable height on all data rows
     # ------------------------------------------------------------------
     @staticmethod
-    def _set_data_row_heights(ws, start_row: int, height: float = 18) -> None:
+    @staticmethod
+    def _set_data_row_heights(ws, start_row: int, height: float = 18,
+                               text_cols: Optional[List[int]] = None) -> None:
+        """
+        Set row heights; expand rows with long text in specified columns.
+
+        For rows where text_cols are given, the height is calculated from
+        content length so wrapped text actually fits without clipping.
+        """
+        CHARS_PER_LINE = 55    # approximate characters per standard-width line
+        LINE_HEIGHT    = 14    # pixels per text line
+        MIN_HEIGHT     = max(float(height), 18.0)
+        MAX_HEIGHT     = 160.0  # cap to avoid enormous rows
+
         for r in range(start_row, ws.max_row + 1):
-            if ws.row_dimensions[r].height is None or \
-               ws.row_dimensions[r].height < height:
-                ws.row_dimensions[r].height = height
+            row_height = MIN_HEIGHT
+            if text_cols:
+                for col in text_cols:
+                    cell_val = str(ws.cell(row=r, column=col).value or "")
+                    if cell_val:
+                        lines = max(1, len(cell_val) // CHARS_PER_LINE + 1)
+                        row_height = max(row_height,
+                                         min(lines * LINE_HEIGHT, MAX_HEIGHT))
+            ws.row_dimensions[r].height = row_height
 
     # ═══════════════════════════════════════════════════════════════════
     # PREPARE SUMMARY FOR EXCEL (v3+ Upgrade)
@@ -4514,8 +4448,8 @@ class FeedbackInsightEngine:
         pdf.add_page()
 
         EPW = pdf.epw    # effective page width  (~182 mm)
-        LH  = 5.5        # standard line height
-        SH  = 7.0        # section header height
+        LH  = 6.0        # standard line height (increased for readability)
+        SH  = 7.5        # section header height
 
         # ── Helpers ───────────────────────────────────────────────────
         def sec_hdr(title: str) -> None:
@@ -4566,12 +4500,20 @@ class FeedbackInsightEngine:
         pdf.ln(6)
 
         # ══════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════
         # PAGE 1  —  SURVEY SNAPSHOT
         # ══════════════════════════════════════════════════════════════
-        total_resp = sum(
-            qd["dataset_summary"].get("Total Responses", 0)
-            for qd in self.question_results.values()
+        # Total Responses = the number of respondents in the survey.
+        # All questions share the SAME respondent pool, so we take the
+        # maximum across questions rather than summing (which would give
+        # 5×2500 = 12500 for a 5-question survey with 2500 respondents).
+        total_resp = max(
+            (qd["dataset_summary"].get("Total Responses", 0)
+             for qd in self.question_results.values()),
+            default=0,
         )
+        # Themes Identified = total themes found across all questions
+        # (correct to sum, since each question produces its own themes)
         total_themes = sum(
             len(qd["summary"]) for qd in self.question_results.values()
         )
@@ -4608,16 +4550,37 @@ class FeedbackInsightEngine:
         pdf.ln(3)
 
         # ══════════════════════════════════════════════════════════════
-        # PAGE 1  —  CROSS-QUESTION THEMES
+        # PAGE 1  —  CROSS-QUESTION THEMES  (proper table)
         # ══════════════════════════════════════════════════════════════
         if self.cross_question_themes:
             sec_hdr("THEMES RECURRING ACROSS MULTIPLE QUESTIONS")
-            pdf.set_fill_color(255, 235, 235)
-            pdf.set_text_color(150, 0, 0)
-            pdf.set_font("Helvetica", "I", 8)
-            themes_str = "  *  ".join(self.cross_question_themes[:6])
-            pdf.multi_cell(EPW, LH, _s(f"  {themes_str}"),
-                           border=1, align="L", fill=True)
+
+            cw_rt = [68, 24, 26, 54]
+            tbl_hdr(cw_rt, ["Recurring Theme", "# Questions",
+                             "Respondents", "Top Question"])
+
+            for theme_name in self.cross_question_themes:
+                qs_found: List[str] = []
+                total_r: int = 0
+                for qname_r, qdata_r in self.question_results.items():
+                    s_df_r = qdata_r["summary"]
+                    match  = s_df_r[s_df_r["Theme"] == theme_name]
+                    if not match.empty:
+                        qs_found.append(
+                            qname_r.replace("_", " ").title()
+                        )
+                        resp_col_r = (
+                            "Respondent Count"
+                            if "Respondent Count" in s_df_r.columns
+                            else "Response Count"
+                        )
+                        total_r += int(match[resp_col_r].iloc[0])
+
+                top_q  = qs_found[0] if qs_found else "—"
+                bg_row = PRI_BG["HIGH"] if total_r > 30 else STRIPE
+                vals   = [theme_name, str(len(qs_found)), str(total_r), top_q]
+                data_row(cw_rt, vals, bg=bg_row, fg=DARK_GREY)
+
             pdf.ln(3)
 
         # ══════════════════════════════════════════════════════════════
@@ -4673,15 +4636,15 @@ class FeedbackInsightEngine:
         pdf.ln(2)
 
         # ══════════════════════════════════════════════════════════════
-        # PAGE 2+  —  PER-QUESTION THEME TABLES
+        # PAGE 2+  —  PER-QUESTION THEME TABLES (one page per question)
         # ══════════════════════════════════════════════════════════════
-        pdf.add_page()
-
         qcw  = [50, 14, 18, 30, 70]
         qhdr = ["Theme", "Resp.", "Priority", "Owner", "Recommendation"]
         # "Resp." = Respondent Count (abbreviated to fit PDF column)
 
         for qname, qdata in self.question_results.items():
+            # Each question gets its own page for clean, readable output
+            pdf.add_page()
             s_df  = qdata["summary"]
             ds    = qdata["dataset_summary"]
             insig = qdata["insights"]
@@ -4719,30 +4682,58 @@ class FeedbackInsightEngine:
             # Column headers
             tbl_hdr(qcw, qhdr)
 
-            # Data rows — top 6 themes
+            # Data rows — top 6 themes, with full recommendation via multi_cell
             for row_i, (_, row) in enumerate(s_df.head(6).iterrows()):
                 pri  = str(row.get("Priority", "LOW")).upper()
                 bg   = PRI_BG.get(pri, WHITE)
                 fg   = PRI_FG.get(pri, DARK_GREY)
                 base = bg if row_i % 2 == 0 else STRIPE
-                rec  = str(row.get("Recommendation", ""))
-                rec_short = rec.split(".")[0][:75]
-                if len(rec) > 75:
-                    rec_short += "..."
 
-                # Section 7: show respondent count in PDF (more meaningful than share%)
                 resp_count = row.get(
-                    "Respondent Count",
-                    row.get("Response Count", "—")
+                    "Respondent Count", row.get("Response Count", "—")
                 )
-                vals = [
-                    str(row.get("Theme", ""))[:38],
-                    str(resp_count),
-                    pri,
-                    str(row.get("Action Owner", ""))[:22],
-                    rec_short,
+                rec_full   = str(row.get("Recommendation", ""))
+                theme_str  = _s(str(row.get("Theme", ""))[:40])
+                owner_str  = _s(str(row.get("Action Owner", ""))[:24])
+
+                # Estimate row height from recommendation length
+                rec_lines = max(2, len(rec_full) // 85 + 1)
+                row_h     = float(max(LH * 1.5, rec_lines * (LH - 0.5)))
+
+                x_start  = pdf.l_margin
+                y_before = pdf.get_y()
+                x_cursor = x_start
+
+                # Fixed-width cells: Theme | Resp | Priority | Owner
+                fixed_cols = [
+                    (50, theme_str,        "",  DARK_GREY),
+                    (14, str(resp_count),  "",  DARK_GREY),
+                    (18, pri,              "B", fg),
+                    (30, owner_str,        "",  DARK_GREY),
                 ]
-                data_row(qcw, vals, base, fg, bold_col=2)
+                for w, v, style, colour in fixed_cols:
+                    pdf.set_xy(x_cursor, y_before)
+                    pdf.set_fill_color(*base)
+                    pdf.set_text_color(*colour)
+                    pdf.set_font("Helvetica", style, 7)
+                    pdf.cell(w, row_h, _s(f" {v}"), border=1,
+                             align="L", fill=True)
+                    x_cursor += w
+
+                # Recommendation column — multi_cell wraps full text
+                pdf.set_xy(x_cursor, y_before)
+                pdf.set_fill_color(*base)
+                pdf.set_text_color(*DARK_GREY)
+                pdf.set_font("Helvetica", "", 6.5)
+                pdf.multi_cell(
+                    70, LH - 0.5,
+                    _s(" " + rec_full[:450]),
+                    border=1, align="L", fill=True,
+                )
+
+                # Advance to next row
+                pdf.set_xy(x_start, pdf.get_y())
+                pdf.ln(0.5)
 
             pdf.ln(4)
 
@@ -4916,29 +4907,61 @@ class FeedbackInsightEngine:
         # TABLE 2: Cross-Question Themes (if any)
         # ─────────────────────────────────────────────────────────────
         if self.cross_question_themes:
-            header = ws.cell(row=next_row, column=1, 
-                           value="⚠  THEMES RECURRING ACROSS MULTIPLE QUESTIONS")
-            header.font = Font(bold=True, size=11, color="FFFFFF")
-            header.fill = PatternFill(
-                start_color="C00000",
-                end_color="C00000",
-                fill_type="solid",
-            )
+            header = ws.cell(row=next_row, column=1,
+                             value="⚠  THEMES RECURRING ACROSS MULTIPLE QUESTIONS")
+            header.font  = Font(bold=True, size=11, color="FFFFFF")
+            header.fill  = PatternFill(start_color="C00000", end_color="C00000",
+                                       fill_type="solid")
             header.border = self._thin_border()
             ws.merge_cells(start_row=next_row, start_column=1,
-                          end_row=next_row, end_column=EXEC_MERGE)
+                           end_row=next_row, end_column=EXEC_MERGE)
+            ws.row_dimensions[next_row].height = 22
+            next_row += 1
+
+            # Sub-header row: 3 columns (no Representative Quote)
+            sub_fill = PatternFill(start_color=self.SUBHEAD_COLOUR,
+                                   end_color=self.SUBHEAD_COLOUR, fill_type="solid")
+            rec_hdrs = ["Recurring Theme", "Appears in # Questions",
+                        "Total Respondents"]
+            for ci, h in enumerate(rec_hdrs, 1):
+                hc = ws.cell(row=next_row, column=ci, value=h)
+                hc.font      = Font(bold=True, size=9, color="000000")
+                hc.fill      = sub_fill
+                hc.border    = self._thin_border()
+                hc.alignment = Alignment(horizontal="center", vertical="center",
+                                         wrap_text=True)
             ws.row_dimensions[next_row].height = 20
             next_row += 1
 
-            for t in self.cross_question_themes:
-                c = ws.cell(row=next_row, column=1, value=t)
-                c.alignment = Alignment(wrap_text=True, vertical="center")
-                c.border = self._thin_border()
-                c.fill = PatternFill(start_color="FFE0E0", end_color="FFE0E0",
-                                    fill_type="solid")
-                ws.merge_cells(start_row=next_row, start_column=1,
-                              end_row=next_row, end_column=EXEC_MERGE)
-                ws.row_dimensions[next_row].height = 18
+            stripe_red = PatternFill(start_color="FFE0E0", end_color="FFE0E0",
+                                     fill_type="solid")
+            for theme_name in self.cross_question_themes:
+                questions_found:  List[str] = []
+                total_respondents: int = 0
+
+                for qname, qdata in self.question_results.items():
+                    s_df_q = qdata["summary"]
+                    match = s_df_q[s_df_q["Theme"] == theme_name]
+                    if not match.empty:
+                        questions_found.append(
+                            qname.replace("_", " ").title()
+                        )
+                        resp_col_q = (
+                            "Respondent Count"
+                            if "Respondent Count" in s_df_q.columns
+                            else "Response Count"
+                        )
+                        total_respondents += int(match[resp_col_q].iloc[0])
+
+                vals      = [theme_name, len(questions_found), total_respondents]
+                col_aligns = ["left", "center", "center"]
+                for ci, (val, align) in enumerate(zip(vals, col_aligns), 1):
+                    c = ws.cell(row=next_row, column=ci, value=val)
+                    c.alignment = Alignment(wrap_text=True, vertical="top",
+                                            horizontal=align)
+                    c.border = self._thin_border()
+                    c.fill   = stripe_red
+                ws.row_dimensions[next_row].height = 22
                 next_row += 1
             next_row += 1
 
@@ -5199,7 +5222,21 @@ class FeedbackInsightEngine:
                 f"A{next_row}:{get_column_letter(len(available_cols))}"
                 f"{ws.max_row}"
             )
-            self._set_data_row_heights(ws, start_row=data_start, height=20)
+
+            # Content-aware row heights: expand rows that contain long text
+            text_col_indices = [
+                available_cols.index(cn) + 1
+                for cn in ("Representative Quote", "Recommendation",
+                           "Key Keywords", "Actions", "Trigger Status")
+                if cn in available_cols
+            ]
+            self._set_data_row_heights(
+                ws, start_row=data_start, height=22,
+                text_cols=text_col_indices,
+            )
+
+            # Freeze header row so column names stay visible when scrolling
+            ws.freeze_panes = ws.cell(row=data_start, column=1)
             self.smart_col_widths(ws)
 
         # ══════════════════════════════════════════════════════════════
@@ -5801,6 +5838,93 @@ class FeedbackInsightEngine:
             ws.column_dimensions["A"].width = 20   # Location
             ws.column_dimensions["C"].width = 28   # Top Issue
 
+        # ══════════════════════════════════════════════════════════════
+        # LOCATION CHARTS SHEET  (only when geo breakdown exists)
+        # ══════════════════════════════════════════════════════════════
+        geo = getattr(self, "geo_breakdown", {})
+        if geo:
+            ws_gc = wb.create_sheet("Location Charts")
+            self.write_sheet_heading(
+                ws_gc,
+                title="Geographic Theme Distribution — by Location",
+                subtitle=f"County-level breakdown  |  {now_eat}",
+                merge_cols=20,
+            )
+            chart_cursor = 4    # first data row (rows 1-3 = heading)
+            BLOCK_H      = 32   # rows reserved per question block
+
+            for qname, loc_data in geo.items():
+                if not loc_data:
+                    continue
+                safe_q = re.sub(r"[^\w ]", "", qname).strip()
+
+                # Top 5 themes and up to 10 locations (most responsive first)
+                from collections import Counter as _Counter
+                all_theme_counts = _Counter()
+                for ld in loc_data.values():
+                    for t, cnt in ld["theme_counts"].items():
+                        all_theme_counts[t] += cnt
+                top_themes = [t for t, _ in all_theme_counts.most_common(5)]
+                locations  = sorted(
+                    loc_data.keys(),
+                    key=lambda l: -loc_data[l]["total"]
+                )[:10]
+
+                data_row_start = chart_cursor
+
+                # Header: Location | Theme1 | Theme2 | ...
+                ws_gc.cell(row=data_row_start, column=1,
+                           value=f"{safe_q} — Location")
+                for ti, t in enumerate(top_themes, 2):
+                    ws_gc.cell(row=data_row_start, column=ti, value=t[:24])
+                self.style_table_header(ws_gc, header_row=data_row_start)
+
+                for li, loc in enumerate(locations, 1):
+                    ws_gc.cell(row=data_row_start + li, column=1, value=loc)
+                    tc = loc_data[loc]["theme_counts"]
+                    for ti, t in enumerate(top_themes, 2):
+                        ws_gc.cell(row=data_row_start + li, column=ti,
+                                   value=tc.get(t, 0))
+
+                data_row_end = data_row_start + len(locations)
+                n_series     = len(top_themes)
+
+                # Clustered horizontal bar chart — best for location comparisons
+                bar = BarChart()
+                bar.type      = "bar"   # horizontal bars
+                bar.grouping  = "clustered"
+                bar.style     = 11
+                bar.title     = (
+                    f"{safe_q.replace('_', ' ').title()}: Theme by Location"
+                )
+                bar.y_axis.title            = "Location"
+                bar.x_axis.title            = "Number of Responses"
+                bar.y_axis.majorGridlines   = None
+                bar.legend.position         = "b"
+                bar.width  = 22
+                bar.height = 14
+
+                cats = Reference(
+                    ws_gc, min_col=1,
+                    min_row=data_row_start + 1, max_row=data_row_end,
+                )
+                for ti in range(2, 2 + n_series):
+                    data_ref = Reference(
+                        ws_gc, min_col=ti,
+                        min_row=data_row_start, max_row=data_row_end,
+                    )
+                    bar.add_data(data_ref, titles_from_data=True)
+                bar.set_categories(cats)
+
+                anchor_col = get_column_letter(n_series + 3)
+                ws_gc.add_chart(bar, f"{anchor_col}{data_row_start}")
+
+                chart_cursor += BLOCK_H + len(locations) + 3
+
+            ws_gc.column_dimensions["A"].width = 22
+            for ci in range(2, 8):
+                ws_gc.column_dimensions[get_column_letter(ci)].width = 18
+
         wb.save(output)
         log.info("✅ Report saved → %s", output)
 
@@ -6168,8 +6292,8 @@ class FeedbackInsightEngine:
         Write ai_prompt_helper.txt — a ready-to-paste ChatGPT prompt covering
         THREE tasks: recommendations, theme names, and action owners.
 
-        Always generated after every run.  Paste into ChatGPT, save the JSON
-        response as chatgpt_output.json, then run process_chatgpt_output.py.
+        Always generated after every run. Paste into ChatGPT, save the JSON
+        response as ai_output.json, then run process_ai_output.py.
         """
         out_path = Path(self.config.ai_prompt_output_path)
 
@@ -6193,7 +6317,6 @@ class FeedbackInsightEngine:
 
         sector_ctx = self.config.sector or "survey feedback analysis"
         n_q        = len(self.question_results)
-        FALLBACK_TEXT = FALLBACK_RECOMMENDATION[:60]  # for comparison in prompt
 
         lines = [
             "=" * 70,
@@ -6217,18 +6340,17 @@ class FeedbackInsightEngine:
             "",
             "ONLY rewrite the recommendation if ONE of these is true:",
             "  a) It starts with 'Conduct targeted focus-group' (generic fallback)",
-            "  b) It clearly does not match the theme's keywords or quote",
-            "  c) It gives advice for the wrong domain (e.g., market advice for a",
-            "     training theme)",
+            "  b) It clearly does not match the theme keywords or quote",
+            "  c) It gives advice for the wrong domain",
             "",
             "If the current recommendation is already specific and relevant,",
             "return it UNCHANGED — copy it word-for-word.",
             "",
-            "When writing a NEW recommendation (1–3 sentences):",
-            "  • Address the theme's specific issue directly",
+            "When writing a NEW recommendation (2–4 sentences):",
+            "  • Address the theme issue directly",
             "  • Use Kenyan/African context: M-Pesa, boda-boda, SMS/USSD,",
             "    county structures, barazas, chama groups, etc.",
-            "  • Positive themes (sentiment_label=Positive) → amplification advice,",
+            "  • Positive themes (sentiment_label=Positive) → amplification,",
             "    NOT a fix",
             "",
             "━" * 50,
@@ -6246,16 +6368,14 @@ class FeedbackInsightEngine:
             "UNCHANGED — copy it exactly.",
             "",
             "Good names are 2–4 words, immediately understood by a non-technical",
-            "M&E officer. Examples:",
-            "  'Late Input Delivery', 'Loan Repayment Burden',",
-            "  'Field Officer Gaps', 'Market Linkage Issues'",
+            "M&E officer.",
             "",
             "━" * 50,
             "TASK 3 — ACTION OWNERS:",
             "━" * 50,
             "For each theme, review the 'current_owner'.",
             "",
-            "Choose the single most responsible team from this list:",
+            "Choose the single most responsible team from this list ONLY:",
             "  • Logistics/Supply Chain    (delivery, transport, collection points)",
             "  • Finance/Loan Management   (loans, repayment, M-Pesa, credit)",
             "  • Training/Extension        (training sessions, demos, knowledge)",
@@ -6294,6 +6414,7 @@ class FeedbackInsightEngine:
             "• All three arrays must have ONE entry per theme, in the SAME ORDER.",
             "• Do NOT skip any theme.",
             "• Unchanged fields → copy the current value exactly.",
+            "• Do not add markdown, code fences, or explanation.",
             "",
             "=" * 70,
             "THEME DATA:",
@@ -6326,9 +6447,10 @@ class FeedbackInsightEngine:
             "=" * 70,
             "AFTER GETTING THE RESPONSE:",
             "─" * 50,
-            "1. Save the JSON block ChatGPT returns as  chatgpt_output.json",
-            "2. Run:  python process_chatgpt_output.py",
-            "3. Re-run the pipeline.",
+            "1. Save the JSON block ChatGPT returns as  ai_output.json",
+            "   (same folder as the pipeline files)",
+            "2. In Colab, run Cell 5 (process_ai_output.py)",
+            "3. Re-run the pipeline (Cell 4).",
             "=" * 70,
         ]
 
@@ -6341,8 +6463,8 @@ class FeedbackInsightEngine:
             )
             print(f"\n{'═' * 62}")
             print(f"  AI PROMPT HELPER saved → {out_path}")
-            print( "  Paste into ChatGPT, save response as chatgpt_output.json,")
-            print( "  then run:  python process_chatgpt_output.py")
+            print( "  Paste into ChatGPT, save response as ai_output.json,")
+            print( "  then run process_ai_output.py")
             print(f"{'═' * 62}\n")
         except Exception as exc:
             log.warning("Could not write ai_prompt_helper.txt: %s", exc)
