@@ -658,6 +658,35 @@ class EngineConfig:
     #   "gemini-1.5-flash"   — slightly older, also free tier
     #   "gemini-1.5-pro"     — higher quality, lower free-tier quota
 
+    # --- Custom recommendations (AI-assisted rule-based workflow) ---
+    custom_recommendations_path: str = "custom_recommendations.json"
+    # Path to a JSON file containing user-defined recommendation rules.
+    # These are loaded at startup and checked BEFORE the built-in
+    # RECOMMENDATION_RULES — so your entries always win.
+    #
+    # HOW TO CREATE THIS FILE (the AI-assisted workflow):
+    #   1. Run the pipeline once with use_llm_recommendations=False.
+    #   2. The pipeline writes  ai_prompt_helper.txt  to disk.
+    #   3. Open that file and paste its contents into ChatGPT.
+    #   4. ChatGPT returns a JSON array of rule objects.
+    #   5. Save that JSON as  custom_recommendations.json.
+    #   6. Re-run — your rules are used everywhere, rule-based is accurate.
+    #
+    # File format:
+    # [
+    #   {
+    #     "keywords": ["delivery", "late", "inputs", "seeds"],
+    #     "recommendation": "Overhaul input supply timing: pre-position..."
+    #   },
+    #   ...
+    # ]
+
+    ai_prompt_output_path: str = "ai_prompt_helper.txt"
+    # Path where the pipeline writes the ready-to-paste ChatGPT prompt.
+    # Generated after every run when use_llm_recommendations=False.
+    # Contains actual keywords, sample quotes, and a structured prompt
+    # for generating both recommendations AND theme names in one paste.
+
 
 # ══════════════════════════════════════════════════════════════════════
 # STOP WORDS  ─ English + Swahili + Sheng + African-English fillers
@@ -1322,6 +1351,69 @@ def _is_kobo_file(df: pd.DataFrame) -> bool:
     return False
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# CUSTOM RECOMMENDATIONS LOADER
+# ══════════════════════════════════════════════════════════════════════
+
+def _load_custom_recommendations(
+    path: str = "custom_recommendations.json",
+) -> List[Tuple[List[str], str]]:
+    """
+    Load user-defined recommendation rules from a JSON file.
+
+    These rules are checked BEFORE the built-in RECOMMENDATION_RULES —
+    so your entries always win when keywords match.
+
+    HOW TO CREATE THIS FILE (AI-assisted workflow):
+    ───────────────────────────────────────────────
+    1. Run the pipeline once (use_llm_recommendations=False).
+    2. Open  ai_prompt_helper.txt  (auto-generated next to your Excel report).
+    3. Paste the entire contents into ChatGPT (or any AI tool).
+    4. ChatGPT returns a JSON array of recommendation rules.
+    5. Save that JSON as  custom_recommendations.json.
+    6. Re-run — your rules are loaded here and used everywhere.
+
+    File format:
+    [
+      {
+        "keywords": ["delivery", "late", "inputs", "seeds"],
+        "recommendation": "Overhaul input supply timing: ..."
+      },
+      ...
+    ]
+
+    Returns [] (empty list, no error) if the file does not exist.
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            log.warning("custom_recommendations.json must be a JSON array — ignored.")
+            return []
+        rules: List[Tuple[List[str], str]] = []
+        for item in data:
+            kws = item.get("keywords", [])
+            rec = item.get("recommendation", "").strip()
+            if kws and rec:
+                rules.append((
+                    [str(k).lower().strip() for k in kws if k],
+                    rec,
+                ))
+        log.info(
+            "Custom recommendations loaded: %d rule(s) from %s "
+            "(checked before built-in rules).",
+            len(rules), p,
+        )
+        return rules
+    except Exception as exc:
+        log.warning("Could not load custom_recommendations.json (%s): %s", p, exc)
+        return []
+
+
 # ══════════════════════════════════════════════════════════════════════
 # RECOMMENDATION RULES  ─ Africa / Kenya context
 # ══════════════════════════════════════════════════════════════════════
@@ -1655,6 +1747,17 @@ class FeedbackInsightEngine:
         )
         # Accumulated unknown-token data across questions (cleared per run)
         self._token_review_data: Dict[str, dict] = {}
+
+        # ── Custom recommendations (AI-assisted rule-based workflow) ───
+        # Loaded at startup and prepended to RECOMMENDATION_RULES so user
+        # rules always take priority over the built-in fallbacks.
+        _custom = _load_custom_recommendations(
+            self.config.custom_recommendations_path
+        )
+        # Build the effective rule list: custom first, then built-in
+        self._effective_rec_rules: List[Tuple[List[str], str]] = (
+            _custom + list(RECOMMENDATION_RULES)
+        )
 
         # ── Section 8: Theme Registry (persistent name stability) ─────
         # Loaded once at startup; new names written back at end of run().
@@ -3003,6 +3106,74 @@ class FeedbackInsightEngine:
     # CLUSTER SUMMARY BUILD
     # ══════════════════════════════════════════════════════════════════
 
+    # ──────────────────────────────────────────────────────────────────
+    # REPRESENTATIVE QUOTE SELECTOR
+    # ──────────────────────────────────────────────────────────────────
+
+    def _select_representative_quote(
+        self,
+        subset: pd.DataFrame,
+        keywords: List[str],
+        cluster_avg_sentiment: float,
+    ) -> str:
+        """
+        Choose the single sentence that best represents a cluster.
+
+        Scoring formula (two weighted criteria):
+          keyword_score   = fraction of top keywords found in this sentence
+                            (0 – 1).  Weight: 0.70.
+          sentiment_score = proximity of this sentence's sentiment to the
+                            cluster average: 1 – |sent_i – avg| / 2.
+                            Weight: 0.30.
+
+        WHY THESE WEIGHTS?
+        ──────────────────
+        Keyword overlap is the dominant signal — the quote MUST contain words
+        that explain WHY this cluster was formed and WHAT the theme is about.
+        A client reading "one acre fund helped us find a buyer" as the
+        representative quote for a theme whose keywords are
+        "training, sessions, spacing" is immediately confused.
+        Sentiment proximity is secondary — it ensures the quote does not
+        contradict the theme's own average sentiment label.
+
+        Minimum length guard: sentences shorter than 6 words are excluded
+        from consideration (they are usually fragments that survived
+        preprocessing but carry no useful context).
+        """
+        kw_set = {k.lower().strip() for k in keywords if k.strip()}
+
+        best_text  = ""
+        best_score = -1.0
+
+        for _, row in subset.iterrows():
+            text = str(row.get("clean_text", "")).strip()
+            if not text or len(text.split()) < 6:
+                continue
+
+            # Keyword overlap: how many cluster keywords appear in this sentence?
+            words = set(text.lower().split())
+            kw_hits = len(kw_set & words) / max(len(kw_set), 1)
+
+            # Sentiment proximity: how close is this sentence to the cluster mean?
+            sent_i = float(row.get("sentiment", 0.0))
+            sent_prox = 1.0 - min(abs(sent_i - cluster_avg_sentiment) / 2.0, 1.0)
+
+            score = 0.70 * kw_hits + 0.30 * sent_prox
+
+            if score > best_score:
+                best_score = score
+                best_text  = text
+
+        # Fallback: if nothing scored (all fragments), take longest sentence
+        if not best_text and not subset.empty:
+            best_text = max(
+                subset["clean_text"].fillna("").tolist(),
+                key=lambda t: len(t.split()),
+                default="",
+            )
+
+        return best_text
+
     def build_cluster_summary(self) -> None:
         self.cluster_summary = {}
         for cid in sorted(self.q_df["cluster"].unique()):
@@ -3012,27 +3183,31 @@ class FeedbackInsightEngine:
             kw      = self.extract_keywords(indices, self.config.top_keywords)
 
             # ── Section 7: Respondent Count Fix ──────────────────────
-            # sentence_count  = number of sentence units in this cluster.
-            #                   One long response can produce several units,
-            #                   so this OVER-counts distinct people.
-            # respondent_count = unique orig_idx values = ACTUAL number of
-            #                   distinct respondents who contributed to this
-            #                   theme.  This is the correct "how many people
-            #                   mentioned this" metric.
             sentence_count    = len(texts)
             respondent_count  = (
                 subset["orig_idx"].nunique()
                 if "orig_idx" in subset.columns
-                else sentence_count          # graceful fallback if orig_idx absent
+                else sentence_count
+            )
+
+            # ── Representative quote: keyword-matched + sentiment-aligned ──
+            cluster_avg_sent = (
+                subset["sentiment"].mean()
+                if "sentiment" in subset.columns and len(subset) > 0
+                else 0.0
+            )
+            rep_quote = self._select_representative_quote(
+                subset, kw, cluster_avg_sent
             )
 
             self.cluster_summary[cid] = {
-                "count":            sentence_count,    # raw sentence units (internal)
-                "respondent_count": respondent_count,  # PRIMARY metric (Section 7)
-                "keywords":         kw,
-                "samples":          texts[:5],
+                "count":              sentence_count,
+                "respondent_count":   respondent_count,
+                "keywords":           kw,
+                "samples":            texts[:5],          # kept for LLM naming context
+                "representative_quote": rep_quote,        # now properly selected
             }
-            # Pre-warm the theme name cache while cluster data is fresh
+            # Pre-warm theme name cache while cluster data is fresh
             self.generate_theme_name(kw, texts[:3])
 
     # ══════════════════════════════════════════════════════════════════
@@ -3096,7 +3271,10 @@ class FeedbackInsightEngine:
                 "intensity":       round(intensity, 3),
                 "sentiment_score": round(avg_sent, 3),
                 "keywords":        [k.strip() for k in info.get("keywords", []) if k.strip()],
-                "representative_quote": info.get("samples", [""])[0] if info.get("samples") else "",
+                "representative_quote": (
+                    info.get("representative_quote")
+                    or (info.get("samples", [""])[0] if info.get("samples") else "")
+                ),
                 "recommendation":  info.get("recommendation", "") or "",
             })
 
@@ -3259,40 +3437,39 @@ class FeedbackInsightEngine:
     # ══════════════════════════════════════════════════════════════════
 
     def classify_theme_sentiment(self) -> None:
-        """Classify theme sentiment using BOTH sentiment score AND keywords.
-        
-        This prevents false neutrals where a theme seems like a problem
-        but sentiment is borderline.
-        
-        Thresholds (v3.0):
-        - Problem: sentiment < -0.05 OR (keywords match problem terms)
-        - Positive: sentiment > 0.1 AND no problem keywords
-        - Neutral: everything else
         """
-        problem_keywords = {
-            "problem", "issue", "complaint", "poor", "bad", "terrible",
-            "awful", "horrible", "delay", "slow", "difficult", "challenge",
-            "struggle", "frustrate", "disappoint", "dissat", "fail",
-            "broken", "error", "bug", "stuck", "unavailable", "shortage",
-            "late", "waiting", "queue", "rude", "unfriendly", "expensive",
-            "costly", "mbaya", "tatizo", "shida", "lalamiko"
-        }
-        
+        Classify each theme's sentiment label from its Average Sentiment score.
+
+        Thresholds — aligned with README spec and build_summary_table():
+          ≤ -0.05  →  Problem
+          ≥  0.05  →  Positive
+          between  →  Neutral
+
+        WHY PURE SCORE-BASED (no keyword override):
+        ─────────────────────────────────────────────
+        The previous version used a "has_problem_keyword" check that flagged
+        any theme containing words like "training", "late", or "delay" as
+        "Problem" regardless of the actual sentiment score.  This caused:
+          • A theme with avg sentiment +0.015 labelled "Problem" because
+            "delay" appeared in the keywords even though respondents were
+            broadly satisfied.
+          • Mismatched recommendations (loan repayment given to a training theme).
+          • Client confusion when a green representative quote sat next to
+            a red "Problem" label.
+
+        Sentiment score already encodes the meaning of the keywords through
+        the three-pathway blended VADER + Swahili lexicon computation.
+        Let it do its job — no second-guessing via keyword lookup.
+        """
         labels = []
-        for idx, row in self.summary_df.iterrows():
-            sentiment = row["Average Sentiment"]
-            keywords = str(row.get("Key Keywords", "")).lower()
-            
-            # Check if problem keywords present
-            has_problem_keyword = any(pk in keywords for pk in problem_keywords)
-            
-            if sentiment < -0.05 or has_problem_keyword:
+        for _, row in self.summary_df.iterrows():
+            score = float(row.get("Average Sentiment", 0.0))
+            if score <= -0.05:
                 labels.append("Problem")
-            elif sentiment > 0.1 and not has_problem_keyword:
+            elif score >= 0.05:
                 labels.append("Positive")
             else:
                 labels.append("Neutral")
-        
         self.summary_df["Theme Sentiment"] = labels
 
     # ══════════════════════════════════════════════════════════════════
@@ -3465,16 +3642,72 @@ class FeedbackInsightEngine:
         self._rule_based_recommendations()
 
     def _rule_based_recommendations(self) -> None:
-        """Match theme keywords against RECOMMENDATION_RULES."""
+        """
+        Match each theme to the best recommendation using scored keyword matching.
+
+        HOW MATCHING WORKS (upgraded from first-match to best-match):
+        ──────────────────────────────────────────────────────────────
+        For every theme the pipeline scores ALL rules in _effective_rec_rules
+        and picks the one with the highest keyword overlap:
+
+            score = (matching keywords) / (total rule keywords)
+
+        WHY SCORED RATHER THAN FIRST-MATCH?
+        ─────────────────────────────────────
+        First-match caused two problems you experienced:
+          1. Multiple themes with very different issues (Training, Repayment,
+             Market) all matched the same loan-repayment rule because "market"
+             or "price" appeared in a generic rule earlier in the list.
+          2. The order of RECOMMENDATION_RULES determined the result —
+             unrelated to the actual theme content.
+
+        Scored matching means:
+          • A theme whose keywords are ["repayment", "loan", "mpesa", "harvest"]
+            scores 4/6 on the loan rule and 0/8 on the training rule.
+            It gets the loan recommendation, correctly.
+          • A theme whose keywords are ["training", "sessions", "spacing",
+            "fertilizer"] scores 3/8 on the training rule and 0/6 on the loan
+            rule.  It gets the training recommendation, correctly.
+
+        CUSTOM RULES ALWAYS WIN (checked first):
+        _effective_rec_rules = custom_recommendations.json rules  +  built-in rules.
+        If a custom rule scores equally with a built-in rule, the custom rule
+        wins because it appears earlier in the list.
+
+        MINIMUM SCORE THRESHOLD:
+        At least 1 keyword must match (score > 0) to use a rule.
+        If nothing matches at all, FALLBACK_RECOMMENDATION is used and the
+        theme is flagged in the log so you can add a rule for it.
+        """
         recs = []
         for _, row in self.summary_df.iterrows():
-            text = (row["Theme"] + " " + row["Key Keywords"]).lower()
-            matched = FALLBACK_RECOMMENDATION
-            for rule_keywords, rec in RECOMMENDATION_RULES:
-                if any(k in text for k in rule_keywords):
-                    matched = rec
-                    break
-            recs.append(matched)
+            theme_text = (
+                str(row.get("Theme", "")) + " "
+                + str(row.get("Key Keywords", ""))
+            ).lower()
+
+            best_rec   = FALLBACK_RECOMMENDATION
+            best_score = 0.0
+            best_rule_kws: List[str] = []
+
+            for rule_keywords, rec in self._effective_rec_rules:
+                if not rule_keywords:
+                    continue
+                hits  = sum(1 for k in rule_keywords if k in theme_text)
+                score = hits / len(rule_keywords)
+                if score > best_score:
+                    best_score    = score
+                    best_rec      = rec
+                    best_rule_kws = rule_keywords
+
+            if best_score == 0.0:
+                log.debug(
+                    "No rule matched theme '%s' (keywords: %s) — using fallback.",
+                    row.get("Theme", ""), row.get("Key Keywords", ""),
+                )
+
+            recs.append(best_rec)
+
         if "Recommendation" in self.summary_df.columns:
             self.summary_df["Recommendation"] = recs
         else:
@@ -5696,6 +5929,10 @@ class FeedbackInsightEngine:
         if (self._anthropic_client or self._gemini_client) and self.config.use_llm_recommendations:
             self._print_llm_keyword_summary()
 
+        # ── AI prompt helper — always written so ChatGPT workflow is available ─
+        # Gives the user a ready-to-paste prompt for recommendations + naming.
+        self._export_ai_prompt_helper()
+
         # ── Section 8: Persist theme registry to disk ─────────────────
         self._save_theme_registry()
 
@@ -5837,6 +6074,178 @@ class FeedbackInsightEngine:
         print(f"  KEYWORD TIPS report to tune RECOMMENDATION_RULES.")
         print(f"{'═' * 62}\n")
 
+    def _export_ai_prompt_helper(self) -> None:
+        """
+        Write ai_prompt_helper.txt — a ready-to-paste ChatGPT prompt that
+        lets you use AI to generate both recommendations AND theme names
+        without a paid API key.
+
+        WHEN IS THIS GENERATED?
+        ────────────────────────
+        Always after every run.  Use it when use_llm_recommendations=False
+        (rule-based mode) to improve accuracy with AI-assisted rules.
+
+        WORKFLOW (Issues 3 & 4 — Recommendations + Theme Naming):
+        ───────────────────────────────────────────────────────────
+        STEP 1 — Open ai_prompt_helper.txt.
+        STEP 2 — Paste ALL of its contents into ChatGPT (or any AI tool).
+                 No editing needed — the file contains the full prompt.
+        STEP 3 — ChatGPT returns a JSON object with two sections:
+                   "recommendations" — rules for custom_recommendations.json
+                   "theme_names"     — names for theme_registry.json
+        STEP 4A (Recommendations):
+                 Copy the "recommendations" array.
+                 Save as  custom_recommendations.json  next to the pipeline.
+                 Re-run — your rules are loaded first, accuracy improves.
+        STEP 4B (Theme Names):
+                 Copy the "theme_names" object.
+                 Open theme_registry.json, find each fingerprint, edit the
+                 "name" field to match ChatGPT's suggestion, then re-run.
+                 OR: use engine._theme_registry.rename("old", "new").
+
+        FILE CONTENTS:
+        ──────────────
+        • System context: sector, number of questions analysed.
+        • Per theme: question, current name, keywords, sentiment label,
+          average sentiment score, representative quote, respondent count.
+        • Exact output format specification so ChatGPT returns parseable JSON.
+        • Example of expected output so the AI understands the structure.
+        """
+        out_path = Path(self.config.ai_prompt_output_path)
+
+        # ── Collect theme data from all questions ──────────────────────
+        all_themes_for_prompt = []
+        for qname, qdata in self.question_results.items():
+            s_df = qdata["summary"]
+            for _, row in s_df.iterrows():
+                kws = [k.strip() for k in str(row.get("Key Keywords", "")).split(",") if k.strip()]
+                all_themes_for_prompt.append({
+                    "question":        qname,
+                    "current_name":    str(row.get("Theme", "")),
+                    "keywords":        kws,
+                    "sentiment_label": str(row.get("Theme Sentiment", "Neutral")),
+                    "avg_sentiment":   round(float(row.get("Average Sentiment", 0.0)), 3),
+                    "respondent_count":int(row.get("Respondent Count", row.get("Response Count", 0))),
+                    "representative_quote": str(row.get("Representative Quote", "")),
+                    "current_recommendation": str(row.get("Recommendation", "")),
+                })
+
+        sector_ctx = self.config.sector or "survey feedback analysis"
+        n_q        = len(self.question_results)
+
+        # ── Build the prompt ───────────────────────────────────────────
+        lines = [
+            "=" * 70,
+            "AI PROMPT HELPER — FeedbackInsightEngine",
+            "Generated: " + datetime.now(EAT).strftime("%d %b %Y %H:%M EAT"),
+            "=" * 70,
+            "",
+            "INSTRUCTIONS FOR CHATGPT:",
+            "─" * 50,
+            "You are an expert M&E (Monitoring & Evaluation) advisor working in",
+            f"the {sector_ctx} sector in Kenya/East Africa.",
+            "",
+            "I have run an NLP survey analysis pipeline that clustered",
+            f"{n_q} open-ended survey question(s) into themes.",
+            "I need your help with TWO tasks:",
+            "",
+            "TASK 1 — RECOMMENDATIONS:",
+            "For each theme below, write ONE practical, specific recommendation",
+            "(2–4 sentences). Use Kenyan/African context where relevant:",
+            "M-Pesa, boda-boda, SMS/USSD, county structures, barazas, etc.",
+            "The recommendation should directly address the theme's issue.",
+            "Positive themes (sentiment_label=Positive) should get an",
+            "amplification recommendation, not a fix recommendation.",
+            "",
+            "TASK 2 — THEME NAMES:",
+            "For each theme, suggest a clearer 2–4 word label that a",
+            "non-technical M&E officer would immediately understand.",
+            "The label must reflect the KEYWORDS, not just the current name.",
+            "Examples of good labels:",
+            "  'Late Input Delivery', 'Loan Repayment Burden',",
+            "  'Field Officer Coverage', 'Market Linkage Gaps'",
+            "",
+            "OUTPUT FORMAT — return ONLY this JSON object, nothing else:",
+            "{",
+            '  "recommendations": [',
+            '    {"question": "q1_inputs", "current_name": "Training Session", "recommendation": "..."},',
+            '    ...',
+            '  ],',
+            '  "theme_names": [',
+            '    {"question": "q1_inputs", "current_name": "Training Session", "better_name": "..."},',
+            '    ...',
+            '  ]',
+            "}",
+            "",
+            "IMPORTANT:",
+            "• Return entries in the SAME ORDER as the themes listed below.",
+            "• One entry per theme in each array.",
+            "• Do not skip any theme.",
+            "• Do not add markdown, code fences, or explanation.",
+            "",
+            "=" * 70,
+            "THEME DATA:",
+            "=" * 70,
+            "",
+        ]
+
+        for i, t in enumerate(all_themes_for_prompt, 1):
+            lines += [
+                f"Theme {i}:",
+                f"  Question          : {t['question']}",
+                f"  Current name      : {t['current_name']}",
+                f"  Keywords          : {', '.join(t['keywords'])}",
+                f"  Sentiment label   : {t['sentiment_label']}",
+                f"  Avg sentiment     : {t['avg_sentiment']:+.3f}  "
+                f"(+ve=positive, -ve=negative, 0=neutral)",
+                f"  Respondents       : {t['respondent_count']}",
+                f"  Representative quote:",
+                f"    \"{t['representative_quote']}\"",
+                f"  Current recommendation (may need improvement):",
+            ]
+            # Wrap current recommendation for readability
+            rec = t["current_recommendation"]
+            for chunk in [rec[j:j+70] for j in range(0, min(len(rec), 280), 70)]:
+                lines.append(f"    {chunk}")
+            if len(rec) > 280:
+                lines.append("    [truncated — full text in Excel report]")
+            lines.append("")
+
+        lines += [
+            "=" * 70,
+            "HOW TO USE THE OUTPUT:",
+            "─" * 50,
+            "RECOMMENDATIONS → save as  custom_recommendations.json:",
+            '[',
+            '  {"keywords": ["keyword1", "keyword2", ...], "recommendation": "..."},',
+            '  ...',
+            ']',
+            "Extract the keywords from the theme's keyword list above.",
+            "Include 4–8 of the most specific keywords for that theme.",
+            "",
+            "THEME NAMES → open theme_registry.json and edit the 'name'",
+            "field for the matching entry, then re-run the pipeline.",
+            "=" * 70,
+        ]
+
+        prompt_text = "\n".join(lines)
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(prompt_text)
+            log.info(
+                "✅ AI prompt helper written → %s  (%d themes, %d lines)",
+                out_path, len(all_themes_for_prompt), len(lines),
+            )
+            print(f"\n{'═' * 62}")
+            print(f"  AI PROMPT HELPER saved → {out_path}")
+            print( "  Paste its contents into ChatGPT to get:")
+            print( "    • Accurate recommendations  → custom_recommendations.json")
+            print( "    • Better theme names        → theme_registry.json")
+            print(f"{'═' * 62}\n")
+        except Exception as exc:
+            log.warning("Could not write ai_prompt_helper.txt: %s", exc)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # ENTRY POINT  ─ configure and run
@@ -5915,6 +6324,13 @@ if __name__ == "__main__":
         # theme_registry.json is auto-created on first run.
         # Edit it manually to rename any theme permanently.
         theme_registry_path="theme_registry.json",
+
+        # ── AI-Assisted Rule-Based Workflow ───────────────────────────
+        # After every run, ai_prompt_helper.txt is written automatically.
+        # Paste it into ChatGPT to get recommendations + better theme names.
+        # Save ChatGPT's recommendation output as custom_recommendations.json.
+        custom_recommendations_path="custom_recommendations.json",
+        ai_prompt_output_path="ai_prompt_helper.txt",
     )
 
     engine = FeedbackInsightEngine(
