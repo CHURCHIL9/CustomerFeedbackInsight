@@ -332,7 +332,7 @@ import pandas as pd
 import yaml
 from nltk.sentiment import SentimentIntensityAnalyzer
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, PieChart, Reference
+from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from sentence_transformers import SentenceTransformer
@@ -4852,6 +4852,107 @@ class FeedbackInsightEngine:
     # EXCEL REPORT  ─ multi-question, fully rebuilt
     # ══════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _patch_col_chart_rotation(wb_bytes: bytes) -> bytes:
+        """
+        Post-process a saved workbook to:
+          1. Inject -45° x-axis label rotation into column (vertical) bar charts.
+          2. Set ALL chart titles to 14pt bold, centered.
+          3. Push the plot area down on column charts so tall bars
+             never overlap the title.
+        Horizontal bar charts (Location Charts) are NOT given the
+        rotated catAx or the plot-area layout — only the title upgrade.
+        """
+        import zipfile as _zf, io as _io, re as _re
+
+        # ── -45° rotation block injected into column chart catAx ─────
+        TXPR = (
+            '<txPr>'
+            '<a:bodyPr'
+            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+            ' rot="-2700000"'
+            ' spcFirstLastPara="1"'
+            ' vertOverflow="ellipsis"'
+            ' vert="horz"'
+            ' wrap="square"'
+            ' anchor="ctr"'
+            ' anchorCtr="1"/>'
+            '<a:lstStyle'
+            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>'
+            '<a:p'
+            ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            '<a:pPr><a:defRPr b="0"/></a:pPr>'
+            '</a:p>'
+            '</txPr>'
+        )
+
+        # ── Plot-area layout: pushed down 18% to clear the title ─────
+        # Applied ONLY to column bar charts (not horizontal location charts).
+        PLOT_LAYOUT = (
+            '<c:layout>'
+            '<c:manLayout>'
+            '<c:layoutTarget val="inner"/>'
+            '<c:xMode val="factor"/>'
+            '<c:yMode val="factor"/>'
+            '<c:x val="0.08"/>'   # 8% from left
+            '<c:y val="0.18"/>'   # 18% from top  → title has clear air above bars
+            '<c:w val="0.84"/>'   # 84% wide
+            '<c:h val="0.70"/>'   # 70% tall
+            '</c:manLayout>'
+            '</c:layout>'
+        )
+
+        with _zf.ZipFile(_io.BytesIO(wb_bytes), 'r') as zin:
+            file_map = {n: zin.read(n) for n in zin.namelist()}
+
+        for name in list(file_map):
+            if not (name.startswith('xl/charts/chart') and name.endswith('.xml')):
+                continue
+
+            xml = file_map[name].decode('utf-8')
+            is_col_bar = 'barDir val="col"' in xml
+
+            # ── 1. Rotate category-axis labels (column charts only) ───
+            if '</catAx>' in xml and is_col_bar:
+                xml = xml.replace('</catAx>', TXPR + '</catAx>', 1)
+
+            # ── 2. Upgrade chart title to 14 pt bold ─────────────────
+            # openpyxl writes:  <a:rPr lang="en-US" dirty="0"/>
+            # We inject sz="1400" (14 pt) and b="1" (bold) into every
+            # <a:rPr> that lives inside the <c:title> block.
+            if '<c:title>' in xml:
+                def _upgrade_title(m):
+                    block = m.group(0)
+                    if 'sz=' in block:          # already patched — skip
+                        return block
+                    # Self-closing  <a:rPr ... />
+                    block = block.replace('<a:rPr ', '<a:rPr sz="1400" b="1" ')
+                    # Rare: bare self-close  <a:rPr/>
+                    block = block.replace('<a:rPr/>', '<a:rPr sz="1400" b="1"/>')
+                    # Rare: opening tag  <a:rPr>
+                    block = block.replace('<a:rPr>', '<a:rPr sz="1400" b="1">')
+                    return block
+
+                xml = _re.sub(
+                    r'<c:title>[\s\S]*?</c:title>',
+                    _upgrade_title,
+                    xml,
+                )
+
+            # ── 3. Push plot area down (column charts only) ───────────
+            # Gives the title clear vertical separation from the tallest bar.
+            # Only injected when no <c:layout> block already exists.
+            if is_col_bar and '<c:plotArea>' in xml and '<c:layout>' not in xml:
+                xml = xml.replace('<c:plotArea>', '<c:plotArea>' + PLOT_LAYOUT, 1)
+
+            file_map[name] = xml.encode('utf-8')
+
+        buf = _io.BytesIO()
+        with _zf.ZipFile(buf, 'w', _zf.ZIP_DEFLATED) as zout:
+            for name, data in file_map.items():
+                zout.writestr(name, data)
+        return buf.getvalue()
+
     def build_excel_report(self, output: Optional[str] = None) -> None:
         output = output or self.config.output_filename
         now_eat = datetime.now(EAT).strftime("%d %b %Y %H:%M EAT")
@@ -5240,39 +5341,33 @@ class FeedbackInsightEngine:
             self.smart_col_widths(ws)
 
         # ══════════════════════════════════════════════════════════════
-        # 3. CHARTS SHEET (Professional Styling - v3.0)
-        #    Features:
-        #    - Clean professional styling with modern chart look
-        #    - No gridlines for clarity
-        #    - Clear titles and axis labels
-        #    - Legend positioned right (not overlapping pie)
+        # 3. CHARTS SHEET — MS Excel compatible
+        #    Each question: one professional vertical bar chart.
+        #    All bars same colour (varyColors=False) + explicit series fill.
+        #    X-axis labels rotated -45° via XML patch (_patch_col_chart_rotation).
+        #    Y-axis max scaled to 1.25× tallest bar → title never overlaps bars.
         # ══════════════════════════════════════════════════════════════
         ws = wb.create_sheet("Charts")
 
-        CHART_BLOCK_ROWS = 38   # rows allocated per question block
-        BAR_W, BAR_H   = 20, 13  # bar chart dimensions (optimized spacing)
-        PIE_W, PIE_H   = 15, 13  # pie chart dimensions (optimized spacing)
-        BAR_ANCHOR_COL = "D"     # bar chart left edge
-        PIE_ANCHOR_COL = "U"     # pie chart left edge (well spaced from bar)
+        CHART_BLOCK_ROWS = 42   # rows per question block
+        BAR_W, BAR_H   = 24, 16  # wider + taller for better readability in Excel
+        BAR_ANCHOR_COL = "D"
+        BAR_FILL_COLOUR = "4472C4"  # standard Excel blue
 
-        # Page heading
         self.write_sheet_heading(
             ws,
             title="Charts  —  Feedback Distribution by Theme",
             subtitle=f"Generated: {now_eat}",
-            merge_cols=26,
+            merge_cols=20,
         )
-
-        # Data area starts at row 4 (rows 1-2 = heading, row 3 = spacer)
-        data_cursor = 4
+        data_cursor = 4   # rows 1-3 = heading
 
         for q_idx, (qname, qdata) in enumerate(self.question_results.items()):
-            s_df = qdata["summary"]
-            safe_q = re.sub(r"[^\w ]", "", qname).strip().replace("_", " ").title()
+            s_df    = qdata["summary"]
+            safe_q  = re.sub(r"[^\w ]", "", qname).strip().replace("_", " ").title()
+            block_start = data_cursor
 
-            block_start = data_cursor  # anchor row for both charts
-
-            # Section label above data
+            # ── Section label ─────────────────────────────────────────
             lbl = ws.cell(row=block_start, column=1, value=safe_q)
             lbl.font = Font(bold=True, size=11, color="FFFFFF")
             lbl.fill = PatternFill(
@@ -5282,77 +5377,82 @@ class FeedbackInsightEngine:
             )
             ws.row_dimensions[block_start].height = 20
 
-            # Column headers for data table
+            # ── Data table (header + rows) ────────────────────────────
             ws.cell(row=block_start + 1, column=1, value="Theme")
             ws.cell(row=block_start + 1, column=2, value="Respondents")
             self.style_table_header(ws, header_row=block_start + 1)
 
-            # Section 7: use Respondent Count; fall back to Response Count
             count_col = (
                 "Respondent Count" if "Respondent Count" in s_df.columns
                 else "Response Count"
             )
-
-            # Data rows
+            chart_df = s_df.head(10)  # cap at 10 themes for readability
             for offset, (_, r) in enumerate(
-                s_df[["Theme", count_col]].iterrows(), start=2
+                chart_df[["Theme", count_col]].iterrows(), start=2
             ):
                 ws.cell(row=block_start + offset, column=1, value=r["Theme"])
-                ws.cell(row=block_start + offset, column=2,
-                        value=r[count_col])
+                ws.cell(row=block_start + offset, column=2, value=r[count_col])
 
-            data_end = block_start + 1 + len(s_df)
-
-            # References (header row included for title)
+            data_end = block_start + 1 + len(chart_df)
             data_ref = Reference(ws, min_col=2,
                                   min_row=block_start + 1, max_row=data_end)
             cats_ref = Reference(ws, min_col=1,
                                   min_row=block_start + 2, max_row=data_end)
 
-            # ── Bar chart (Professional v3.0) ──────────────────────────
+            # ── Compute max value for headroom ────────────────────────
+            numeric_vals = pd.to_numeric(
+                chart_df[count_col], errors="coerce"
+            ).dropna()
+            max_val = int(numeric_vals.max()) if len(numeric_vals) > 0 else 10
+
+            # ── Bar chart (column / vertical) ─────────────────────────
             bar = BarChart()
-            bar.type    = "col"
-            bar.style   = 11  # Modern professional style
-            bar.title   = f"{safe_q}\nTheme Distribution"
-            bar.y_axis.title = "Number of Responses"
-            bar.x_axis.title = "Feedback Theme"
-            bar.legend  = None          # No legend for cleaner look
-            
-            # Remove gridlines for professional appearance
-            bar.y_axis.majorGridlines = None
-            
-            # Set axis scaling to start from 0 and be visible
+            bar.type      = "col"
+            bar.grouping  = "clustered"
+            bar.varyColors = False    # all bars same colour in Excel
+            bar.style     = 2         # clean white background
+            bar.title     = f"{safe_q} — Theme Distribution"
+            bar.y_axis.title = "Respondents"
+            bar.x_axis.title = ""
+            bar.legend    = None      # theme names appear on x-axis
+            bar.gapWidth  = 120
             bar.y_axis.scaling.minVal = 0
-            bar.y_axis.delete = False  # Ensure axis is visible
-            bar.x_axis.delete = False  # Ensure axis is visible
-            
+            # FIX: headroom above tallest bar so it never touches the title.
+            # 1.25× gives a 25% gap between the tallest bar and the chart top.
+            bar.y_axis.scaling.maxVal = max_val * 1.25
+            bar.y_axis.majorGridlines  = None
+            bar.x_axis.majorGridlines  = None
+
+            # FIX: Explicitly keep both axes visible in Excel
+            bar.x_axis.delete = False
+            bar.y_axis.delete = False
+
+            # FIX: Ensure category labels (theme names) render on x-axis
+            bar.x_axis.tickLblPos = "low"
+            bar.x_axis.numFmt = "General"
+
+            # Data labels: values on top of each bar
+            from openpyxl.chart.label import DataLabelList
+            dl = DataLabelList()
+            dl.showVal        = True
+            dl.showLegendKey  = False
+            dl.showCatName    = False
+            dl.showSerName    = False
+            dl.showPercent    = False
+            bar.dLbls = dl
+
             bar.add_data(data_ref, titles_from_data=True)
             bar.set_categories(cats_ref)
             bar.width  = BAR_W
             bar.height = BAR_H
-            
-            # Add data labels (values on top of bars) - openpyxl limitation
-            # requires setting dataLbls XML attribute manually if using openpyxl
-            # For now, chart shows cleanly with professional styling
+
+            # FIX: Uniform fill colour on all bars — must be set after add_data()
+            for series in bar.series:
+                series.graphicalProperties.solidFill = BAR_FILL_COLOUR
+                series.graphicalProperties.line.solidFill = BAR_FILL_COLOUR
+
             ws.add_chart(bar, f"{BAR_ANCHOR_COL}{block_start}")
 
-            # ── Pie chart (Professional v3.0) ─────────────────────────
-            pie = PieChart()
-            pie.style   = 11  # Modern professional style
-            pie.title   = f"{safe_q}\nPercentage Share"
-            
-            # Position legend to RIGHT to prevent overlap
-            pie.legend.position = "r"  # 'r' = right
-            
-            pie.add_data(data_ref, titles_from_data=True)
-            pie.set_categories(cats_ref)
-            pie.width  = PIE_W
-            pie.height = PIE_H
-            
-            # Anchor pie well to the right of the bar chart
-            ws.add_chart(pie, f"{PIE_ANCHOR_COL}{block_start}")
-
-            # Advance cursor by the fixed block height
             data_cursor += CHART_BLOCK_ROWS
 
         ws.column_dimensions["A"].width = 38
@@ -5850,82 +5950,138 @@ class FeedbackInsightEngine:
                 subtitle=f"County-level breakdown  |  {now_eat}",
                 merge_cols=20,
             )
-            chart_cursor = 4    # first data row (rows 1-3 = heading)
-            BLOCK_H      = 32   # rows reserved per question block
+            chart_cursor = 4
+
+            # Palette for multi-series location chart — distinct, accessible colours
+            SERIES_COLOURS = ["4472C4", "ED7D31", "70AD47", "FFC000", "9E480E"]
 
             for qname, loc_data in geo.items():
                 if not loc_data:
                     continue
                 safe_q = re.sub(r"[^\w ]", "", qname).strip()
 
-                # Top 5 themes and up to 10 locations (most responsive first)
                 from collections import Counter as _Counter
                 all_theme_counts = _Counter()
                 for ld in loc_data.values():
                     for t, cnt in ld["theme_counts"].items():
                         all_theme_counts[t] += cnt
-                top_themes = [t for t, _ in all_theme_counts.most_common(5)]
+
+                # Cap at top 3 themes — keeps bars readable in Excel
+                top_themes = [t for t, _ in all_theme_counts.most_common(3)]
                 locations  = sorted(
                     loc_data.keys(),
                     key=lambda l: -loc_data[l]["total"]
-                )[:10]
+                )[:8]   # cap at 8 locations for readability
+
+                n_locs   = len(locations)
+                n_series = len(top_themes)
+                if n_series == 0 or n_locs == 0:
+                    continue
 
                 data_row_start = chart_cursor
 
-                # Header: Location | Theme1 | Theme2 | ...
+                # ── Data table: Location | Theme1 | Theme2 | Theme3 ──
                 ws_gc.cell(row=data_row_start, column=1,
                            value=f"{safe_q} — Location")
                 for ti, t in enumerate(top_themes, 2):
-                    ws_gc.cell(row=data_row_start, column=ti, value=t[:24])
+                    # Truncate long theme names for column headers
+                    ws_gc.cell(row=data_row_start, column=ti, value=t[:32])
                 self.style_table_header(ws_gc, header_row=data_row_start)
 
                 for li, loc in enumerate(locations, 1):
-                    ws_gc.cell(row=data_row_start + li, column=1, value=loc)
+                    ws_gc.cell(row=data_row_start + li, column=1, value=str(loc))
                     tc = loc_data[loc]["theme_counts"]
                     for ti, t in enumerate(top_themes, 2):
                         ws_gc.cell(row=data_row_start + li, column=ti,
-                                   value=tc.get(t, 0))
+                                   value=int(tc.get(t, 0)))
 
-                data_row_end = data_row_start + len(locations)
-                n_series     = len(top_themes)
+                data_row_end = data_row_start + n_locs
 
-                # Clustered horizontal bar chart — best for location comparisons
+                # ── Horizontal bar chart ──────────────────────────────
                 bar = BarChart()
-                bar.type      = "bar"   # horizontal bars
+                bar.type      = "bar"        # horizontal — locations on Y-axis
                 bar.grouping  = "clustered"
-                bar.style     = 11
-                bar.title     = (
+                bar.style     = 2
+                bar.varyColors = False
+
+                bar.title = (
                     f"{safe_q.replace('_', ' ').title()}: Theme by Location"
                 )
-                bar.y_axis.title            = "Location"
-                bar.x_axis.title            = "Number of Responses"
-                bar.y_axis.majorGridlines   = None
-                bar.legend.position         = "b"
-                bar.width  = 22
-                bar.height = 14
 
+                # FIX: Remove axis titles entirely on the location chart.
+                # In a horizontal bar chart the x_axis.title ("Respondents")
+                # renders as vertical rotated text on the LEFT side of the chart,
+                # directly overlapping the y-axis location name labels.
+                # The chart title already provides full context — no axis title needed.
+                bar.x_axis.title = ""
+                bar.y_axis.title = ""
+
+                bar.x_axis.majorGridlines = None
+                bar.y_axis.majorGridlines = None
+
+                # FIX: Explicitly keep both axes active so location labels render
+                bar.x_axis.delete = False
+                bar.y_axis.delete = False
+
+                # FIX: "low" places location labels on the LEFT in Excel
+                bar.y_axis.tickLblPos = "low"
+                bar.x_axis.scaling.min = 0
+
+                # FIX: gapWidth=60 → thicker bars (default 150 = very thin)
+                bar.gapWidth = 60
+
+                # Legend on right — clear of bars and location labels
+                bar.legend.position = "r"
+
+                # FIX: height scales with location count (3.2 rows per location)
+                # so bars are tall enough to be readable without crowding.
+                bar.width  = 28
+                bar.height = max(16, n_locs * 3.2)
+
+                # Categories reference (column A = location names)
                 cats = Reference(
                     ws_gc, min_col=1,
                     min_row=data_row_start + 1, max_row=data_row_end,
                 )
+
+                # Add one series per theme with explicit colour
                 for ti in range(2, 2 + n_series):
-                    data_ref = Reference(
+                    series_ref = Reference(
                         ws_gc, min_col=ti,
                         min_row=data_row_start, max_row=data_row_end,
                     )
-                    bar.add_data(data_ref, titles_from_data=True)
+                    bar.add_data(series_ref, titles_from_data=True)
+
                 bar.set_categories(cats)
 
+                # FIX: Apply distinct colours per series after add_data()
+                for si, series in enumerate(bar.series):
+                    colour = SERIES_COLOURS[si % len(SERIES_COLOURS)]
+                    series.graphicalProperties.solidFill = colour
+                    series.graphicalProperties.line.solidFill = colour
+
+                # Anchor chart to the right of the data table
                 anchor_col = get_column_letter(n_series + 3)
                 ws_gc.add_chart(bar, f"{anchor_col}{data_row_start}")
 
-                chart_cursor += BLOCK_H + len(locations) + 3
+                # Advance cursor: chart height in cm → approx Excel rows
+                chart_rows = max(int(bar.height / 0.53) + 4, n_locs + 8)
+                chart_cursor += chart_rows
 
-            ws_gc.column_dimensions["A"].width = 22
-            for ci in range(2, 8):
-                ws_gc.column_dimensions[get_column_letter(ci)].width = 18
+            # Column widths for the data table
+            ws_gc.column_dimensions["A"].width = 26   # location names
+            for ci in range(2, 6):
+                ws_gc.column_dimensions[get_column_letter(ci)].width = 22
 
-        wb.save(output)
+        # ── Save with chart axis-rotation patch ───────────────────────
+        # openpyxl cannot set x-axis label rotation through its Python API.
+        # We save to a buffer, inject the rotation XML into every column
+        # bar chart's catAx element, then write the patched bytes to disk.
+        import io as _io
+        _buf = _io.BytesIO()
+        wb.save(_buf)
+        _patched = self._patch_col_chart_rotation(_buf.getvalue())
+        Path(output).write_bytes(_patched)
         log.info("✅ Report saved → %s", output)
 
     # ═══════════════════════════════════════════════════════════════════
